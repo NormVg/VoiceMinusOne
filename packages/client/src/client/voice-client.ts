@@ -343,6 +343,11 @@ export class VoiceMinusOneClient {
         this.speaker.stop()
         break
       case 'turn_stats': {
+        // If E2E wasn't captured from audio chunks, compute from turnStartTime
+        let e2e = this.e2eLatencyMs
+        if (e2e === null && this.turnStartTime !== null) {
+          e2e = Date.now() - this.turnStartTime
+        }
         const stats: TurnStats = {
           turnId: event.turnId as number,
           sttMs: event.sttMs as number,
@@ -354,7 +359,7 @@ export class VoiceMinusOneClient {
           transcript: event.transcript as string,
           response: event.response as string,
           interrupted: event.interrupted as boolean,
-          e2eLatencyMs: this.e2eLatencyMs ?? undefined,
+          e2eLatencyMs: e2e ?? undefined,
         }
         for (const listener of this.turnStatsListeners) {
           try {

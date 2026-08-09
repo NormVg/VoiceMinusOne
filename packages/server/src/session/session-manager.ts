@@ -295,6 +295,9 @@ export class SessionManager {
         const trimmed = text.trim()
         if (!trimmed) return
         sentenceCount++
+        if (!timings.tts_start) {
+          mark('tts_start')
+        }
         try {
           for await (const chunk of this.audioRouter.synthesizeChunks(trimmed)) {
             if (signal.aborted) return
@@ -352,7 +355,7 @@ export class SessionManager {
       const sttMs = (timings.stt_done ?? 0) - (timings.start ?? 0)
       const brainMs = (timings.brain_done ?? 0) - (timings.brain_start ?? 0)
       const firstAudioMs = timings.first_audio ?? 0
-      const ttsMs = (timings.tts_done ?? 0) - (timings.brain_start ?? 0)
+      const ttsMs = (timings.tts_done ?? 0) - (timings.tts_start ?? timings.brain_start ?? 0)
       this.logger.info('session', [
         `⏱️ TURN STATS (turn ${turnId}):`,
         `  STT:       ${sttMs}ms`,

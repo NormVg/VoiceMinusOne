@@ -127,14 +127,16 @@ export class SarvamSTT implements STTProvider {
     /** Reset the idle timer. After flush, if no message arrives within
      *  the timeout, we consider transcription complete and close the socket.
      *  Kept short (500ms) because Sarvam sends all transcripts quickly
-     *  after flush — the 3s timeout was adding unnecessary latency. */
+     *  after flush — the 3s timeout was adding unnecessary latency.
+     *  Reduced to 200ms as a safety net; we close immediately on
+     *  receiving a final transcript. */
     const resetIdleTimer = (): void => {
       if (idleTimer) clearTimeout(idleTimer)
       if (flushSent) {
         idleTimer = setTimeout(() => {
           wsClosed = true
           resolveMessage?.()
-        }, 500)
+        }, 200)
       }
     }
 
@@ -145,6 +147,13 @@ export class SarvamSTT implements STTProvider {
         if (result) {
           messageQueue.push(result)
           resolveMessage?.()
+          // If we got a final transcript after flush, close immediately
+          // instead of waiting for the idle timer — saves ~500ms latency
+          if (result.isFinal && flushSent) {
+            if (idleTimer) clearTimeout(idleTimer)
+            wsClosed = true
+            resolveMessage?.()
+          }
         }
       } catch (err) {
         this.ctx?.logger.warn('sarvam-stt', `Failed to parse WS message: ${(err as Error).message}`)
