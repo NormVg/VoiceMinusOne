@@ -19,8 +19,8 @@
  * 6. Timing is within acceptable bounds
  */
 
-import { readAudioFile, getAudioInfo } from './audio-reader'
-import { MockSTT, MockTTS, mockBrain, createMockHistory } from './mocks'
+import { readAudioFile, getAudioInfo } from './audio-reader.ts'
+import { MockSTT, MockTTS, mockBrain, createMockHistory } from './mocks.ts'
 import type { AudioChunk, TranscriptResult } from '@voiceminusone/core'
 
 // --- Test results ---
