@@ -349,7 +349,8 @@ export class SileroVADPlugin implements VADProvider {
         return output[0]!
       }
       return 0
-    } catch {
+    } catch (err) {
+      this.ctx?.logger?.debug('silero-vad', `Inference error: ${(err as Error).message}`)
       return 0
     }
   }

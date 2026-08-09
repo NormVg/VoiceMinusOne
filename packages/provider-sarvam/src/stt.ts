@@ -12,6 +12,7 @@ import type {
   TranscriptResult,
   PluginContext,
 } from '@voiceminusone/core'
+import { PluginError } from '@voiceminusone/core'
 import {
   authHeaders,
   concatBuffers,
@@ -219,7 +220,7 @@ export class SarvamSTT implements STTProvider {
 
     if (!res.ok) {
       const body = await res.text()
-      throw new Error(`Sarvam STT ${res.status}: ${body}`)
+      throw new PluginError('STT_FAILED', `Sarvam STT ${res.status}: ${body}`)
     }
 
     const json = (await res.json()) as {
@@ -303,15 +304,15 @@ export class SarvamSTT implements STTProvider {
     // In Node, use the 'ws' package; in browser, use global WebSocket
     const globalWs = (globalThis as unknown as { WebSocket?: typeof WebSocket }).WebSocket
     if (globalWs) return new globalWs(url) as unknown as WebSocketLike
-    throw new Error('No WebSocket implementation available')
+    throw new PluginError('TRANSPORT_CONNECTION_FAILED', 'No WebSocket implementation available')
   }
 
   /** Close a WebSocket connection. */
   private closeWebSocket(ws: WebSocketLike): void {
     try {
       ws.close()
-    } catch {
-      // ignore
+    } catch (err) {
+      this.ctx?.logger?.debug('sarvam-stt', `WS close error: ${(err as Error).message}`)
     }
   }
 

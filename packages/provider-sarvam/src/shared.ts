@@ -2,6 +2,8 @@
  * Shared Sarvam credentials and helpers.
  */
 
+import { PluginError } from '@voiceminusone/core'
+
 export const SARVAM_BASE_URL = 'https://api.sarvam.ai'
 
 export interface SarvamCredentials {
@@ -15,7 +17,7 @@ export function resolveApiKey(explicit?: string): string {
   const env = (globalThis as unknown as { process?: { env?: Record<string, string | undefined> } }).process
   const key = explicit ?? env?.env?.SARVAM_API_KEY
   if (!key) {
-    throw new Error('Sarvam API key missing. Pass apiKey or set SARVAM_API_KEY.')
+    throw new PluginError('PLUGIN_INIT_FAILED', 'Sarvam API key missing. Pass apiKey or set SARVAM_API_KEY.')
   }
   return key
 }

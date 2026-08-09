@@ -2,7 +2,16 @@
  * Sarvam Bulbul TTS provider.
  *
  * Implements the VoiceMinusOne TTSProvider interface.
- * Uses HTTP streaming when available, REST fallback.
+ * Uses WebSocket streaming (wss://api.sarvam.ai/text-to-speech/ws) as the
+ * primary transport — connect once, send config, stream text, receive audio.
+ * Falls back to REST for environments without WebSocket support.
+ *
+ * WebSocket protocol (per Sarvam docs):
+ * 1. Connect: wss://api.sarvam.ai/text-to-speech/ws?api-subscription-key=KEY
+ * 2. Send config: { type: "config", data: { speaker, language_code } }
+ * 3. Send text:   { type: "convert", data: { text } }
+ * 4. Send flush:  { type: "flush" }
+ * 5. Receive:     { type: "audio", data: { audio: "<base64>" } }
  */
 
 import type {
@@ -11,6 +20,7 @@ import type {
   TTSProvider,
   PluginContext,
 } from '@voiceminusone/core'
+import { PluginError } from '@voiceminusone/core'
 import {
   authHeaders,
   resolveApiKey,
@@ -28,11 +38,33 @@ export interface SarvamTTSOptions extends SarvamCredentials {
   sampleRate?: number
 }
 
+/** Message types for the Sarvam TTS WebSocket protocol. */
+type TTSWsMessage =
+  | { type: 'config'; data: { speaker: string; language_code: string } }
+  | { type: 'convert'; data: { text: string } }
+  | { type: 'flush' }
+
+/** Minimal WebSocket interface (works with both browser and ws package). */
+interface TTSWebSocketLike {
+  readonly readyState: number
+  onopen: (() => void) | null
+  onmessage: ((event: { data: unknown }) => void) | null
+  onerror: (() => void) | null
+  onclose: (() => void) | null
+  send(data: string): void
+  close(): void
+}
+
+/** WebSocket readyState.OPEN constant. */
+const WS_OPEN = 1
+
 /**
- * Sarvam Bulbul TTS — streams audio via HTTP, falls back to REST.
+ * Sarvam Bulbul TTS — streams audio via WebSocket.
  *
  * Implements the TTSProvider interface with `synthesize()` returning an
- * AsyncIterable<AudioChunk>.
+ * AsyncIterable<AudioChunk>. Each call to `synthesize()` opens a fresh
+ * WebSocket connection, sends config + text + flush, and yields audio
+ * chunks as they arrive.
  */
 export class SarvamTTS implements TTSProvider {
   readonly name = 'sarvam-tts'
@@ -71,7 +103,13 @@ export class SarvamTTS implements TTSProvider {
   }
 
   /**
-   * Synthesize text to audio. Streams via HTTP when available.
+   * Synthesize text to audio via WebSocket streaming.
+   *
+   * Opens a WebSocket connection to the Sarvam TTS endpoint, sends a config
+   * message, then the text, then a flush signal. Audio chunks arrive as
+   * base64-encoded messages and are yielded as AudioChunk.
+   *
+   * Falls back to REST if WebSocket is unavailable.
    */
   async *synthesize(
     text: string,
@@ -86,136 +124,276 @@ export class SarvamTTS implements TTSProvider {
 
     const sampleRate = this.options.sampleRate ?? 16000
     const numChannels = 1
-
-    const body = {
-      text: trimmed,
-      target_language_code: config.language ?? this.options.language ?? 'en-IN',
-      model: config.model ?? this.options.model ?? 'bulbul:v3',
-      speaker: config.speaker ?? this.options.speaker ?? 'shubh',
-      pace: config.pace ?? this.options.pace ?? 1.0,
-      speech_sample_rate: String(sampleRate),
-    }
+    const speaker = config.speaker ?? this.options.speaker ?? 'shubh'
+    const language = config.language ?? this.options.language ?? 'en-IN'
+    const model = config.model ?? this.options.model ?? 'bulbul:v3'
+    const pace = config.pace ?? this.options.pace ?? 1.0
 
     try {
-      // Prefer HTTP stream endpoint
-      const streamRes = await fetch(`${this.baseUrl}/text-to-speech/stream`, {
-        method: 'POST',
-        headers: {
-          ...authHeaders(this.apiKey),
-          'Content-Type': 'application/json',
-          Accept: 'audio/wav, application/octet-stream',
-        },
-        body: JSON.stringify(body),
-        signal,
-      })
-
-      if (streamRes.ok && streamRes.body) {
-        yield* this.readStream(streamRes.body, sampleRate, numChannels)
-        return
-      }
-
-      // REST fallback
-      const res = await fetch(`${this.baseUrl}/text-to-speech`, {
-        method: 'POST',
-        headers: {
-          ...authHeaders(this.apiKey),
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-        signal,
-      })
-
-      if (!res.ok) {
-        const errBody = await res.text()
-        throw new Error(`Sarvam TTS ${res.status}: ${errBody}`)
-      }
-
-      const json = (await res.json()) as { audios?: string[] }
-      const b64 = json.audios?.[0]
-      if (!b64) return
-
-      const data = base64ToArrayBuffer(b64)
-      const pcm = stripWavHeader(data)
-
-      yield {
-        data: pcm,
+      yield* this.synthesizeWs(trimmed, {
+        speaker,
+        language,
+        model,
+        pace,
         sampleRate,
         numChannels,
-      }
+        signal,
+      })
     } catch (err) {
       if (signal.aborted) return
-      throw err
+      this.ctx?.logger.warn(
+        'sarvam-tts',
+        `WebSocket synthesis failed: ${(err as Error).message}. Falling back to REST.`,
+      )
+      yield* this.synthesizeRest(trimmed, {
+        speaker,
+        language,
+        model,
+        pace,
+        sampleRate,
+        numChannels,
+        signal,
+      })
     } finally {
       this.activeControllers.delete(controller)
     }
   }
 
-  /** Read an HTTP stream, stripping WAV header, yielding PCM chunks. */
-  private async *readStream(
-    body: ReadableStream<Uint8Array>,
-    sampleRate: number,
-    numChannels: number,
+  /**
+   * WebSocket-based synthesis.
+   *
+   * Connects to wss://api.sarvam.ai/text-to-speech/ws, sends config + text +
+   * flush, and yields audio chunks from the response messages.
+   */
+  private async *synthesizeWs(
+    text: string,
+    opts: {
+      speaker: string
+      language: string
+      model: string
+      pace: number
+      sampleRate: number
+      numChannels: number
+      signal: AbortSignal
+    },
   ): AsyncIterable<AudioChunk> {
-    const reader = body.getReader()
-    let pending = new Uint8Array(0)
-    let headerHandled = false
+    const params = new URLSearchParams({
+      'api-subscription-key': this.apiKey,
+      model: opts.model,
+    })
 
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        if (!value || value.byteLength === 0) continue
+    const wsUrl = `${this.baseUrl.replace('https', 'wss')}/text-to-speech/ws?${params}`
 
-        let currentChunk = value
+    const ws = await this.openWebSocket(wsUrl)
+    if (!ws) {
+      throw new PluginError('TTS_FAILED', 'Failed to connect to Sarvam TTS WebSocket')
+    }
 
-        // On first data: detect and skip WAV header if present
-        if (!headerHandled) {
-          headerHandled = true
-          if (
-            currentChunk.length >= 4 &&
-            currentChunk[0] === 0x52 && // R
-            currentChunk[1] === 0x49 && // I
-            currentChunk[2] === 0x46 && // F
-            currentChunk[3] === 0x46 // F
-          ) {
-            const headerSize = 44
-            if (currentChunk.length <= headerSize) continue
-            currentChunk = currentChunk.subarray(headerSize)
+    const audioQueue: ArrayBuffer[] = []
+    let resolveAudio: (() => void) | null = null
+    let wsClosed = false
+    let wsError: Error | null = null
+    let configSent = false
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(String(event.data)) as Record<string, unknown>
+        const msgType = msg.type
+
+        if (msgType === 'audio') {
+          const data = msg.data as Record<string, unknown> | undefined
+          const b64 = data?.audio
+          if (typeof b64 === 'string' && b64.length > 0) {
+            const audioData = base64ToArrayBuffer(b64)
+            const pcm = stripWavHeader(audioData)
+            audioQueue.push(pcm)
+            resolveAudio?.()
           }
+        } else if (msgType === 'event' || msgType === 'complete') {
+          // Completion event — mark as done
+          wsClosed = true
+          resolveAudio?.()
         }
+      } catch (err) {
+        this.ctx?.logger.warn(
+          'sarvam-tts',
+          `Failed to parse WS message: ${(err as Error).message}`,
+        )
+      }
+    }
 
-        const totalLength = pending.length + currentChunk.length
-        const validBytes = totalLength - (totalLength % 2)
+    ws.onerror = () => {
+      wsError = new PluginError('TTS_FAILED', 'Sarvam TTS WebSocket error')
+      wsClosed = true
+      resolveAudio?.()
+    }
 
-        if (validBytes === 0) {
-          const newPending = new Uint8Array(totalLength)
-          newPending.set(pending)
-          newPending.set(currentChunk, pending.length)
-          pending = newPending
-          continue
-        }
+    ws.onclose = () => {
+      wsClosed = true
+      resolveAudio?.()
+    }
 
-        const toYield = new Uint8Array(validBytes)
-        const nextPending = new Uint8Array(totalLength - validBytes)
+    // Wait for connection to open
+    await this.waitForOpen(ws)
 
-        if (pending.length > 0) {
-          toYield.set(pending)
-          toYield.set(currentChunk.subarray(0, validBytes - pending.length), pending.length)
-          nextPending.set(currentChunk.subarray(validBytes - pending.length))
+    // 1. Send config message
+    const configMsg: TTSWsMessage = {
+      type: 'config',
+      data: {
+        speaker: opts.speaker,
+        language_code: opts.language,
+      },
+    }
+    ws.send(JSON.stringify(configMsg))
+    configSent = true
+    this.ctx?.logger.debug('sarvam-tts', 'Sent config message')
+
+    // 2. Send text message
+    const convertMsg: TTSWsMessage = {
+      type: 'convert',
+      data: { text },
+    }
+    ws.send(JSON.stringify(convertMsg))
+    this.ctx?.logger.debug('sarvam-tts', `Sent text (${text.length} chars)`)
+
+    // 3. Send flush to signal end of input
+    const flushMsg: TTSWsMessage = { type: 'flush' }
+    ws.send(JSON.stringify(flushMsg))
+    this.ctx?.logger.debug('sarvam-tts', 'Sent flush')
+
+    // 4. Yield audio chunks as they arrive
+    try {
+      while (!wsClosed || audioQueue.length > 0) {
+        if (audioQueue.length > 0) {
+          const chunk = audioQueue.shift()!
+          yield {
+            data: chunk,
+            sampleRate: opts.sampleRate,
+            numChannels: opts.numChannels,
+          }
         } else {
-          toYield.set(currentChunk.subarray(0, validBytes))
-          nextPending.set(currentChunk.subarray(validBytes))
-        }
-
-        pending = nextPending
-        yield {
-          data: toYield.buffer,
-          sampleRate,
-          numChannels,
+          if (wsClosed) break
+          if (opts.signal.aborted) break
+          await new Promise<void>((resolve) => {
+            resolveAudio = resolve
+          })
+          resolveAudio = null
+          if (wsError) throw wsError
         }
       }
     } finally {
-      reader.releaseLock()
+      this.closeWebSocket(ws)
+    }
+
+    void configSent
+  }
+
+  /** REST fallback synthesis. */
+  private async *synthesizeRest(
+    text: string,
+    opts: {
+      speaker: string
+      language: string
+      model: string
+      pace: number
+      sampleRate: number
+      numChannels: number
+      signal: AbortSignal
+    },
+  ): AsyncIterable<AudioChunk> {
+    const body = {
+      text,
+      target_language_code: opts.language,
+      model: opts.model,
+      speaker: opts.speaker,
+      pace: opts.pace,
+      speech_sample_rate: String(opts.sampleRate),
+    }
+
+    const res = await fetch(`${this.baseUrl}/text-to-speech`, {
+      method: 'POST',
+      headers: {
+        ...authHeaders(this.apiKey),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: opts.signal,
+    })
+
+    if (!res.ok) {
+      const errBody = await res.text()
+      throw new PluginError('TTS_FAILED', `Sarvam TTS ${res.status}: ${errBody}`)
+    }
+
+    const json = (await res.json()) as { audios?: string[] }
+    const b64 = json.audios?.[0]
+    if (!b64) return
+
+    const data = base64ToArrayBuffer(b64)
+    const pcm = stripWavHeader(data)
+
+    yield {
+      data: pcm,
+      sampleRate: opts.sampleRate,
+      numChannels: opts.numChannels,
+    }
+  }
+
+  /** Wait for a WebSocket to reach OPEN state. */
+  private async waitForOpen(ws: TTSWebSocketLike): Promise<void> {
+    if (ws.readyState === WS_OPEN) return
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new PluginError('TTS_FAILED', 'Sarvam TTS WebSocket connect timeout'))
+      }, 10_000)
+
+      const originalOnOpen = ws.onopen
+      ws.onopen = () => {
+        clearTimeout(timer)
+        if (originalOnOpen) originalOnOpen()
+        resolve()
+      }
+
+      const originalOnError = ws.onerror
+      ws.onerror = () => {
+        clearTimeout(timer)
+        if (originalOnError) originalOnError()
+        reject(new PluginError('TTS_FAILED', 'Sarvam TTS WebSocket failed to connect'))
+      }
+    })
+  }
+
+  /** Open a WebSocket connection, returning null on failure. */
+  private async openWebSocket(url: string): Promise<TTSWebSocketLike | null> {
+    try {
+      return this.createWebSocket(url)
+    } catch (err) {
+      this.ctx?.logger.warn(
+        'sarvam-tts',
+        `WS create failed: ${(err as Error).message}`,
+      )
+      return null
+    }
+  }
+
+  /** Create a WebSocket — overridable for testing. */
+  protected createWebSocket(url: string): TTSWebSocketLike {
+    const globalWs = (globalThis as unknown as { WebSocket?: typeof WebSocket }).WebSocket
+    if (globalWs) {
+      return new globalWs(url) as unknown as TTSWebSocketLike
+    }
+    throw new PluginError(
+      'TTS_FAILED',
+      'No WebSocket implementation available',
+    )
+  }
+
+  /** Close a WebSocket connection. */
+  private closeWebSocket(ws: TTSWebSocketLike): void {
+    try {
+      ws.close()
+    } catch (err) {
+      this.ctx?.logger?.debug('sarvam-tts', `WS close error: ${(err as Error).message}`)
     }
   }
 }
@@ -238,7 +416,7 @@ function base64ToArrayBuffer(b64: string): ArrayBuffer {
   }
   // Last resort: manual decode
   const binary = b64.replace(/[^A-Za-z0-9+/]/g, '')
-  const out = new Uint8Array(Math.floor(binary.length * 3 / 4))
+  const out = new Uint8Array(Math.floor((binary.length * 3) / 4))
   let outIdx = 0
   for (let i = 0; i < binary.length; i += 4) {
     const c1 = b64CharToVal(binary[i]!)

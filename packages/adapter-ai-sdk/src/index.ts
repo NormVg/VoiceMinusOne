@@ -16,6 +16,7 @@
  * ```
  */
 
+import { PluginError } from '@voiceminusone/core'
 import type { Brain, BrainContext, ConversationMessage } from '@voiceminusone/core'
 
 /**
@@ -171,12 +172,13 @@ async function loadStreamText(): Promise<StreamTextCaller> {
   try {
     const aiModule = (await import('ai')) as unknown as { streamText?: StreamTextCaller }
     if (!aiModule.streamText) {
-      throw new Error('streamText not found in `ai` package')
+      throw new PluginError('LLM_FAILED', 'streamText not found in the `ai` package')
     }
     return aiModule.streamText
   } catch (err) {
-    throw new Error(
-      `Failed to load AI SDK. Install the \`ai\` package or pass streamText explicitly: ${(err as Error).message}`,
-    )
+      throw new PluginError(
+        'LLM_FAILED',
+        `Failed to load AI SDK. Install the \`ai\` package or pass streamText explicitly: ${(err as Error).message}`,
+      )
   }
 }
