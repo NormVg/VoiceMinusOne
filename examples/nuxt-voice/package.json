@@ -1,0 +1,27 @@
+{
+  "name": "@voiceminusone/example-nuxt",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "nuxt build",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare",
+    "test:browser": "node test/browser-test.mjs"
+  },
+  "dependencies": {
+    "@voiceminusone/client": "workspace:*",
+    "@voiceminusone/core": "workspace:*",
+    "@voiceminusone/server": "workspace:*",
+    "nuxt": "^4.5.2",
+    "vue": "^3.5.40",
+    "vue-router": "^5.2.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13",
+    "puppeteer": "^25.5.0"
+  }
+}

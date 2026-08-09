@@ -25,9 +25,11 @@
   },
   "dependencies": {
     "@voiceminusone/core": "workspace:*",
+    "ws": "^8.18.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@types/ws": "^8.5.13",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"

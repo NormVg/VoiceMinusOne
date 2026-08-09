@@ -29,6 +29,16 @@ export type { HistoryEntry } from './session/history-manager'
 export { SessionManager } from './session/session-manager'
 export type { SessionManagerOptions } from './session/session-manager'
 
+// Transport adapters
+export { WebSocketTransport } from './transport/websocket-transport'
+export type {
+  WebSocketTransportOptions,
+  WsSocket,
+  WsServerLike,
+  WebSocketServerOptions,
+} from './transport/websocket-transport'
+export { WebSocketServer } from './transport/websocket-transport'
+
 // Wire protocol
 export {
   parseClientEvent,
