@@ -13,7 +13,7 @@
 import { readAudioFile, getAudioInfo } from './audio-reader.ts'
 import { SarvamSTT, SarvamTTS } from '@voiceminusone/provider-sarvam'
 import { aiSdkBrain } from '@voiceminusone/adapter-ai-sdk'
-import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
+import { ollama } from 'ai-sdk-ollama'
 import type { AudioChunk, TranscriptResult } from '@voiceminusone/core'
 import { writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
@@ -83,6 +83,11 @@ process.on('unhandledRejection', (reason) => {
 })
 
 async function main(): Promise<void> {
+  // The ai-sdk-ollama package reads OLLAMA_API_KEY from process.env
+  // to authenticate with ollama.com cloud. Set it explicitly so the
+  // underlying ollama client picks it up.
+  process.env.OLLAMA_API_KEY = OLLAMA_API_KEY
+
   console.log('\n🎙️  VoiceMinusOne Real Provider Pipeline')
   console.log('=========================================\n')
   console.log(`Audio file: ${AUDIO_PATH}`)
@@ -178,19 +183,17 @@ async function main(): Promise<void> {
   let brainResponse = ''
   let brainUsedFallback = false
   await runTest('Ollama LLM generates response via AI SDK', async () => {
-    // Use createOpenAICompatible — it works reliably with Ollama's /v1 endpoint.
-    // The native ai-sdk-ollama package has DNS resolution issues with ollama.com.
-    const provider = createOpenAICompatible({
-      name: 'ollama',
-      baseURL: `${OLLAMA_BASE_URL}/v1`,
-      apiKey: OLLAMA_API_KEY,
-    })
+    // Use the native ai-sdk-ollama provider. The ollama npm package
+    // auto-detects ollama.com URLs and reads OLLAMA_API_KEY from the env.
+    // We set process.env.OLLAMA_API_KEY at the top of main() so the
+    // underlying client picks it up automatically.
+    const model = ollama(OLLAMA_MODEL)
 
     // Use aiSdkBrainComplete (non-streaming) to avoid floating promise issues
     // with the AI SDK's streamText when the API returns errors
     const { aiSdkBrainComplete } = await import('@voiceminusone/adapter-ai-sdk')
     const brain = aiSdkBrainComplete({
-      model: provider(OLLAMA_MODEL),
+      model,
       systemPrompt: 'You are a helpful voice assistant. Keep responses concise and conversational. Never use markdown.',
       temperature: 0.7,
     })
