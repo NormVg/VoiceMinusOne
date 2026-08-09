@@ -26,6 +26,8 @@ import {
   resolveApiKey,
   stripWavHeader,
   SARVAM_BASE_URL,
+  createSarvamWebSocket,
+  type SarvamWebSocket,
   type SarvamCredentials,
 } from './shared'
 
@@ -38,22 +40,21 @@ export interface SarvamTTSOptions extends SarvamCredentials {
   sampleRate?: number
 }
 
-/** Message types for the Sarvam TTS WebSocket protocol. */
+/** Message types for the Sarvam TTS WebSocket protocol.
+ *
+ *  Per the Sarvam SDK source:
+ *  - config: { type: "config", data: { language_code, speaker, pitch, pace, loudness,
+ *           speech_sample_rate, enable_preprocessing, output_audio_codec,
+ *           output_audio_bitrate, dict_id, min_buffer_size, max_chunk_length } }
+ *  - text:   { type: "text", data: { text } }  (NOT "convert"!)
+ *  - flush:  { type: "flush" }
+ *  - ping:   { type: "ping" }
+ */
 type TTSWsMessage =
-  | { type: 'config'; data: { speaker: string; language_code: string } }
-  | { type: 'convert'; data: { text: string } }
+  | { type: 'config'; data: Record<string, unknown> }
+  | { type: 'text'; data: { text: string } }
   | { type: 'flush' }
-
-/** Minimal WebSocket interface (works with both browser and ws package). */
-interface TTSWebSocketLike {
-  readonly readyState: number
-  onopen: (() => void) | null
-  onmessage: ((event: { data: unknown }) => void) | null
-  onerror: (() => void) | null
-  onclose: (() => void) | null
-  send(data: string): void
-  close(): void
-}
+  | { type: 'ping' }
 
 /** WebSocket readyState.OPEN constant. */
 const WS_OPEN = 1
@@ -178,13 +179,12 @@ export class SarvamTTS implements TTSProvider {
     },
   ): AsyncIterable<AudioChunk> {
     const params = new URLSearchParams({
-      'api-subscription-key': this.apiKey,
       model: opts.model,
     })
 
     const wsUrl = `${this.baseUrl.replace('https', 'wss')}/text-to-speech/ws?${params}`
 
-    const ws = await this.openWebSocket(wsUrl)
+    const ws = await this.openWebSocket(wsUrl, this.apiKey)
     if (!ws) {
       throw new PluginError('TTS_FAILED', 'Failed to connect to Sarvam TTS WebSocket')
     }
@@ -194,6 +194,20 @@ export class SarvamTTS implements TTSProvider {
     let wsClosed = false
     let wsError: Error | null = null
     let configSent = false
+    let flushSent = false
+    let idleTimer: ReturnType<typeof setTimeout> | null = null
+
+    /** Reset the idle timer. After flush, if no message arrives within
+     *  the timeout, we consider synthesis complete and close the socket. */
+    const resetIdleTimer = (): void => {
+      if (idleTimer) clearTimeout(idleTimer)
+      if (flushSent) {
+        idleTimer = setTimeout(() => {
+          wsClosed = true
+          resolveAudio?.()
+        }, 5000)
+      }
+    }
 
     ws.onmessage = (event) => {
       try {
@@ -206,10 +220,13 @@ export class SarvamTTS implements TTSProvider {
           if (typeof b64 === 'string' && b64.length > 0) {
             const audioData = base64ToArrayBuffer(b64)
             const pcm = stripWavHeader(audioData)
-            audioQueue.push(pcm)
-            resolveAudio?.()
+            // Skip empty chunks (e.g. WAV header-only chunks that strip to 0 bytes)
+            if (pcm.byteLength > 0) {
+              audioQueue.push(pcm)
+              resolveAudio?.()
+            }
           }
-        } else if (msgType === 'event' || msgType === 'complete') {
+        } else if (msgType === 'complete' || msgType === 'finished' || msgType === 'event') {
           // Completion event — mark as done
           wsClosed = true
           resolveAudio?.()
@@ -220,37 +237,50 @@ export class SarvamTTS implements TTSProvider {
           `Failed to parse WS message: ${(err as Error).message}`,
         )
       }
+      resetIdleTimer()
     }
 
-    ws.onerror = () => {
-      wsError = new PluginError('TTS_FAILED', 'Sarvam TTS WebSocket error')
+    ws.onerror = (err?: unknown) => {
+      const errMsg = err ? String(err) : 'unknown error'
+      wsError = new PluginError('TTS_FAILED', `Sarvam TTS WebSocket error: ${errMsg}`)
       wsClosed = true
+      if (idleTimer) clearTimeout(idleTimer)
       resolveAudio?.()
     }
 
     ws.onclose = () => {
       wsClosed = true
+      if (idleTimer) clearTimeout(idleTimer)
       resolveAudio?.()
     }
 
     // Wait for connection to open
     await this.waitForOpen(ws)
 
-    // 1. Send config message
+    // 1. Send config message (full format per Sarvam SDK)
     const configMsg: TTSWsMessage = {
       type: 'config',
       data: {
-        speaker: opts.speaker,
         language_code: opts.language,
+        speaker: opts.speaker,
+        pitch: 0.0,
+        pace: opts.pace,
+        loudness: 1.0,
+        speech_sample_rate: opts.sampleRate,
+        enable_preprocessing: false,
+        output_audio_codec: 'wav',
+        output_audio_bitrate: '128k',
+        min_buffer_size: 50,
+        max_chunk_length: 150,
       },
     }
     ws.send(JSON.stringify(configMsg))
     configSent = true
     this.ctx?.logger.debug('sarvam-tts', 'Sent config message')
 
-    // 2. Send text message
+    // 2. Send text message (type is "text", NOT "convert")
     const convertMsg: TTSWsMessage = {
-      type: 'convert',
+      type: 'text',
       data: { text },
     }
     ws.send(JSON.stringify(convertMsg))
@@ -259,6 +289,8 @@ export class SarvamTTS implements TTSProvider {
     // 3. Send flush to signal end of input
     const flushMsg: TTSWsMessage = { type: 'flush' }
     ws.send(JSON.stringify(flushMsg))
+    flushSent = true
+    resetIdleTimer()
     this.ctx?.logger.debug('sarvam-tts', 'Sent flush')
 
     // 4. Yield audio chunks as they arrive
@@ -282,6 +314,7 @@ export class SarvamTTS implements TTSProvider {
         }
       }
     } finally {
+      if (idleTimer) clearTimeout(idleTimer)
       this.closeWebSocket(ws)
     }
 
@@ -339,9 +372,17 @@ export class SarvamTTS implements TTSProvider {
     }
   }
 
-  /** Wait for a WebSocket to reach OPEN state. */
-  private async waitForOpen(ws: TTSWebSocketLike): Promise<void> {
+  /** Wait for a WebSocket to reach OPEN state.
+   *
+   *  createSarvamWebSocket already awaits the connection open before
+   *  returning, so by the time we get the wrapper the connection is
+   *  already open (readyState === 1). We just verify and return.
+   *  Setting onopen here would race — the event has already fired.
+   */
+  private async waitForOpen(ws: SarvamWebSocket): Promise<void> {
     if (ws.readyState === WS_OPEN) return
+    // Connection not yet open — this shouldn't happen since
+    // createSarvamWebSocket awaits open, but handle gracefully
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(new PluginError('TTS_FAILED', 'Sarvam TTS WebSocket connect timeout'))
@@ -363,10 +404,12 @@ export class SarvamTTS implements TTSProvider {
     })
   }
 
-  /** Open a WebSocket connection, returning null on failure. */
-  private async openWebSocket(url: string): Promise<TTSWebSocketLike | null> {
+  /** Open a WebSocket connection, returning null on failure.
+   *  Uses the shared createSarvamWebSocket helper.
+   */
+  private async openWebSocket(url: string, apiKey: string): Promise<SarvamWebSocket | null> {
     try {
-      return this.createWebSocket(url)
+      return await createSarvamWebSocket(url, apiKey)
     } catch (err) {
       this.ctx?.logger.warn(
         'sarvam-tts',
@@ -376,20 +419,8 @@ export class SarvamTTS implements TTSProvider {
     }
   }
 
-  /** Create a WebSocket — overridable for testing. */
-  protected createWebSocket(url: string): TTSWebSocketLike {
-    const globalWs = (globalThis as unknown as { WebSocket?: typeof WebSocket }).WebSocket
-    if (globalWs) {
-      return new globalWs(url) as unknown as TTSWebSocketLike
-    }
-    throw new PluginError(
-      'TTS_FAILED',
-      'No WebSocket implementation available',
-    )
-  }
-
   /** Close a WebSocket connection. */
-  private closeWebSocket(ws: TTSWebSocketLike): void {
+  private closeWebSocket(ws: SarvamWebSocket): void {
     try {
       ws.close()
     } catch (err) {

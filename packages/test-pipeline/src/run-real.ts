@@ -120,7 +120,7 @@ async function main(): Promise<void> {
       language: 'en-IN',
       model: 'saaras:v3',
       mode: 'transcribe',
-      streaming: false, // Use REST for reliability — WS needs debugging
+      streaming: true, // Use WebSocket streaming
     })
 
     // Init with a minimal context
@@ -178,6 +178,8 @@ async function main(): Promise<void> {
   let brainResponse = ''
   let brainUsedFallback = false
   await runTest('Ollama LLM generates response via AI SDK', async () => {
+    // Use createOpenAICompatible — it works reliably with Ollama's /v1 endpoint.
+    // The native ai-sdk-ollama package has DNS resolution issues with ollama.com.
     const provider = createOpenAICompatible({
       name: 'ollama',
       baseURL: `${OLLAMA_BASE_URL}/v1`,
@@ -317,12 +319,12 @@ async function main(): Promise<void> {
   await runTest('Full pipeline (STT → Brain → TTS) completes', async () => {
     const start = Date.now()
 
-    // Re-run with fresh providers
+    // Re-run with fresh providers — WebSocket STT now works reliably
     const stt = new SarvamSTT({
       apiKey: SARVAM_API_KEY,
       language: 'en-IN',
       model: 'saaras:v3',
-      streaming: false, // Use REST for the timing test (more reliable)
+      streaming: true,
     })
     const tts = new SarvamTTS({
       apiKey: SARVAM_API_KEY,
@@ -345,7 +347,7 @@ async function main(): Promise<void> {
     const sttFinal = sttResults.find((t) => t.isFinal)
     if (!sttFinal) throw new Error('No final transcript')
 
-    // Brain (skip if previous brain call failed)
+    // Brain (reuse the response from the earlier test)
     if (!brainResponse) throw new Error('Brain response unavailable')
 
     // TTS

@@ -14,7 +14,9 @@
     "@voiceminusone/adapter-ai-sdk": "workspace:*",
     "@voiceminusone/core": "workspace:*",
     "@voiceminusone/provider-sarvam": "workspace:*",
-    "ai": "^7.0.58"
+    "ai": "^7.0.58",
+    "ai-sdk-ollama": "^4.1.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "tsx": "^4.19.2",

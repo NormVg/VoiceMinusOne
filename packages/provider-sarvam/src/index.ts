@@ -20,7 +20,7 @@ export { SarvamSTT } from './stt'
 export type { SarvamSTTOptions } from './stt'
 export { SarvamTTS } from './tts'
 export type { SarvamTTSOptions } from './tts'
-export type { SarvamCredentials } from './shared'
+export type { SarvamCredentials, SarvamWebSocket } from './shared'
 export {
   SARVAM_BASE_URL,
   resolveApiKey,
@@ -28,6 +28,7 @@ export {
   concatBuffers,
   pcm16ToWav,
   stripWavHeader,
+  createSarvamWebSocket,
 } from './shared'
 
 export interface SarvamFactory {

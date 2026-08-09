@@ -19,6 +19,8 @@ import {
   pcm16ToWav,
   resolveApiKey,
   SARVAM_BASE_URL,
+  createSarvamWebSocket,
+  type SarvamWebSocket,
   type SarvamCredentials,
 } from './shared'
 
@@ -92,18 +94,19 @@ export class SarvamSTT implements STTProvider {
   ): AsyncIterable<TranscriptResult> {
     const model = config.model ?? this.options.model ?? 'saaras:v3'
     const params = new URLSearchParams({
-      'api-subscription-key': this.apiKey,
       model,
-      'high-vad-sensitivity': 'true',
-      'flush-signal': 'true',
+      high_vad_sensitivity: 'true',
+      flush_signal: 'true',
     })
     const language = config.language ?? this.options.language
-    if (language) params.set('language-code', language)
+    if (language) params.set('language_code', language)
 
     const url = `${this.baseUrl.replace('https', 'wss')}/speech-to-text/ws?${params}`
 
-    // Use the global WebSocket (browser) or ws package (Node)
-    const ws = await this.openWebSocket(url)
+    // Use the shared createSarvamWebSocket helper which handles both
+    // Node.js (ws package with header auth) and browser (query param auth).
+    // It already awaits the connection open before returning.
+    const ws = await this.openWebSocket(url, this.apiKey)
     if (!ws) {
       // Fallback to REST
       yield* this.transcribeRest(audio, config)
@@ -118,6 +121,20 @@ export class SarvamSTT implements STTProvider {
     let resolveMessage: (() => void) | null = null
     let wsClosed = false
     let wsError: Error | null = null
+    let flushSent = false
+    let idleTimer: ReturnType<typeof setTimeout> | null = null
+
+    /** Reset the idle timer. After flush, if no message arrives within
+     *  the timeout, we consider transcription complete and close the socket. */
+    const resetIdleTimer = (): void => {
+      if (idleTimer) clearTimeout(idleTimer)
+      if (flushSent) {
+        idleTimer = setTimeout(() => {
+          wsClosed = true
+          resolveMessage?.()
+        }, 3000)
+      }
+    }
 
     ws.onmessage = (event) => {
       try {
@@ -130,29 +147,55 @@ export class SarvamSTT implements STTProvider {
       } catch (err) {
         this.ctx?.logger.warn('sarvam-stt', `Failed to parse WS message: ${(err as Error).message}`)
       }
+      resetIdleTimer()
     }
 
-    ws.onerror = () => {
-      wsError = new Error('Sarvam STT WebSocket error')
+    ws.onerror = (err?: unknown) => {
+      const errMsg = err ? String(err) : 'unknown error'
+      wsError = new PluginError('STT_FAILED', `Sarvam STT WebSocket error: ${errMsg}`)
       wsClosed = true
+      if (idleTimer) clearTimeout(idleTimer)
       resolveMessage?.()
     }
 
     ws.onclose = () => {
       wsClosed = true
+      if (idleTimer) clearTimeout(idleTimer)
       resolveMessage?.()
     }
 
-    // Send audio chunks
+    // Buffer audio chunks, wrap as WAV, and send as a single message.
+    // The Sarvam API expects WAV-wrapped audio (encoding: "audio/wav"),
+    // not individual raw PCM chunks.
     const sendPromise = (async () => {
+      const chunks: ArrayBuffer[] = []
+      let sampleRate = 16000
       for await (const chunk of audio) {
         if (signal.aborted) break
-        if (ws.readyState !== this.OPEN_STATE) break
-        this.sendWsChunk(ws, chunk)
+        chunks.push(chunk.data)
+        sampleRate = chunk.sampleRate
       }
-      // Send flush signal
-      if (ws.readyState === this.OPEN_STATE) {
+      if (signal.aborted || chunks.length === 0) return
+
+      // Concatenate PCM and wrap as WAV
+      const pcm = concatBuffers(chunks)
+      const wav = pcm16ToWav(pcm, sampleRate)
+      const b64 = arrayBufferToBase64(wav)
+
+      if (ws.readyState !== 1) return
+      ws.send(JSON.stringify({
+        audio: {
+          data: b64,
+          sample_rate: sampleRate,
+          encoding: 'audio/wav',
+        },
+      }))
+
+      // Send flush signal to finalize transcription
+      if (ws.readyState === 1) {
         ws.send(JSON.stringify({ type: 'flush' }))
+        flushSent = true
+        resetIdleTimer()
       }
     })()
 
@@ -171,6 +214,7 @@ export class SarvamSTT implements STTProvider {
         }
       }
     } finally {
+      if (idleTimer) clearTimeout(idleTimer)
       abortController.abort()
       this.closeWebSocket(ws)
       await sendPromise.catch(() => {})
@@ -238,13 +282,30 @@ export class SarvamSTT implements STTProvider {
     }
   }
 
-  /** Parse a WebSocket message into a TranscriptResult. */
+  /** Parse a WebSocket message into a TranscriptResult.
+   *
+   *  Sarvam STT WebSocket response format (per API docs):
+   *  - { type: "data", data: { transcript: "...", language_code: "..." } }
+   *  - { type: "events", data: { signal_type: "START_SPEECH" | "END_SPEECH" } }
+   *  Also handles flat format as fallback.
+   */
   private parseWsMessage(msg: Record<string, unknown>): TranscriptResult | null {
     const type = msg.type ?? msg.event
+
+    // VAD events — not transcripts
+    if (type === 'events' || type === 'event') {
+      const data = msg.data as Record<string, unknown> | undefined
+      const signalType = data?.signal_type ?? data?.signalType
+      if (signalType === 'START_SPEECH' || signalType === 'END_SPEECH') return null
+    }
     if (type === 'START_SPEECH' || type === 'speech_start') return null
     if (type === 'END_SPEECH' || type === 'speech_end') return null
 
+    // Nested format: { type: "data", data: { transcript, language_code } }
+    const nestedData = msg.data as Record<string, unknown> | undefined
     const text =
+      (typeof nestedData?.transcript === 'string' && nestedData.transcript) ||
+      (typeof nestedData?.text === 'string' && nestedData.text) ||
       (typeof msg.transcript === 'string' && msg.transcript) ||
       (typeof msg.text === 'string' && msg.text) ||
       ''
@@ -253,84 +314,51 @@ export class SarvamSTT implements STTProvider {
     const isFinal =
       msg.is_final === true ||
       msg.isFinal === true ||
+      type === 'data' ||
       type === 'transcript' ||
       msg.status === 'final'
+
+    const lang =
+      (typeof nestedData?.language_code === 'string' && nestedData.language_code) ||
+      (typeof nestedData?.language === 'string' && nestedData.language) ||
+      (typeof msg.language_code === 'string' && msg.language_code) ||
+      (typeof msg.language === 'string' && msg.language) ||
+      this.options.language ||
+      'unknown'
 
     return {
       text,
       isFinal: Boolean(isFinal),
-      language: String(
-        msg.language_code ?? msg.language ?? this.options.language ?? 'unknown',
-      ),
+      language: String(lang),
     }
   }
 
-  /** Send an audio chunk over WebSocket. */
-  private sendWsChunk(ws: WebSocketLike, chunk: AudioChunk): void {
-    const b64 = arrayBufferToBase64(chunk.data)
-    ws.send(
-      JSON.stringify({
-        audio: b64,
-        encoding: 'pcm_s16le',
-        sample_rate: chunk.sampleRate,
-      }),
-    )
-  }
-
-  /** Open a WebSocket connection, returning null on failure. */
-  private async openWebSocket(url: string): Promise<WebSocketLike | null> {
+  /** Open a WebSocket connection, returning null on failure.
+   *  Uses the shared createSarvamWebSocket helper which handles both
+   *  Node.js (ws package with header auth) and browser (query param auth).
+   *
+   *  createSarvamWebSocket already awaits the connection open before
+   *  returning, so we must NOT re-wait on onopen here — doing so would
+   *  hang until the 10-second timeout because the open event has already
+   *  fired by the time we set the handler.
+   */
+  private async openWebSocket(url: string, apiKey: string): Promise<SarvamWebSocket | null> {
     try {
-      const ws = this.createWebSocket(url)
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('WS connect timeout')), 10_000)
-        ws.onopen = () => {
-          clearTimeout(timer)
-          resolve()
-        }
-        ws.onerror = () => {
-          clearTimeout(timer)
-          reject(new Error('Sarvam STT WebSocket failed to connect'))
-        }
-      })
-      return ws
+      return await createSarvamWebSocket(url, apiKey)
     } catch (err) {
       this.ctx?.logger.warn('sarvam-stt', `WS connect failed: ${(err as Error).message}`)
       return null
     }
   }
 
-  /** Create a WebSocket — overridable for testing. */
-  protected createWebSocket(url: string): WebSocketLike {
-    // In Node, use the 'ws' package; in browser, use global WebSocket
-    const globalWs = (globalThis as unknown as { WebSocket?: typeof WebSocket }).WebSocket
-    if (globalWs) return new globalWs(url) as unknown as WebSocketLike
-    throw new PluginError('TRANSPORT_CONNECTION_FAILED', 'No WebSocket implementation available')
-  }
-
   /** Close a WebSocket connection. */
-  private closeWebSocket(ws: WebSocketLike): void {
+  private closeWebSocket(ws: SarvamWebSocket): void {
     try {
       ws.close()
     } catch (err) {
       this.ctx?.logger?.debug('sarvam-stt', `WS close error: ${(err as Error).message}`)
     }
   }
-
-  /** ReadyState.OPEN constant — overridable for ws package vs browser. */
-  protected get OPEN_STATE(): number {
-    return 1
-  }
-}
-
-/** Minimal WebSocket interface (works with both browser and ws package). */
-export interface WebSocketLike {
-  readonly readyState: number
-  onopen: (() => void) | null
-  onmessage: ((event: { data: unknown }) => void) | null
-  onerror: (() => void) | null
-  onclose: (() => void) | null
-  send(data: string | ArrayBuffer): void
-  close(): void
 }
 
 /** Convert ArrayBuffer to base64 string. */

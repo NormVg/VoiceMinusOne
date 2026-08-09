@@ -130,7 +130,13 @@ importers:
       '@voiceminusone/core':
         specifier: workspace:*
         version: link:../core
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.3
     devDependencies:
+      '@types/ws':
+        specifier: ^8.5.13
+        version: 8.18.1
       tsup:
         specifier: ^8.3.5
         version: 8.5.1(jiti@2.7.0)(postcss@8.5.26)(tsx@4.23.11)(typescript@5.9.3)(yaml@2.9.0)
@@ -183,6 +189,12 @@ importers:
       ai:
         specifier: ^7.0.58
         version: 7.0.58(zod@3.25.76)
+      ai-sdk-ollama:
+        specifier: ^4.1.0
+        version: 4.1.0(ai@7.0.58(zod@3.25.76))(zod@3.25.76)
+      ws:
+        specifier: ^8.18.0
+        version: 8.21.3
     devDependencies:
       tsx:
         specifier: ^4.19.2
@@ -1698,6 +1710,12 @@ packages:
     resolution: {integrity: sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==}
     engines: {node: '>= 14'}
 
+  ai-sdk-ollama@4.1.0:
+    resolution: {integrity: sha512-WBucDWhYVpahhoY5wAsPy4vbEYc34D7xRJOtfpE5VWkD/cRKG4eY1y3pkyP3pCK/Zmp3cHBuiHWu1vHZ81ljEA==}
+    engines: {node: '>=22'}
+    peerDependencies:
+      ai: ^7.0.31
+
   ai@7.0.58:
     resolution: {integrity: sha512-GfgO90CQQ0yYuoxJAUOeQ6tviyYw1BUIDygSZ1q3Ce6kSc93tYmB5eltKY/NxC0YOouAax7JvDqVnYxvIAr04Q==}
     engines: {node: '>=22'}
@@ -2622,6 +2640,10 @@ packages:
     engines: {node: '>=6'}
     hasBin: true
 
+  jsonrepair@3.15.0:
+    resolution: {integrity: sha512-wy8OTjwsJwQRnQJkKnMJJ9vcytRdBPAgIF/Hy6+s1dAj42BHMKiyL8JzEieIl3JY7idt8eyHwBWTO8mh/+mtwA==}
+    hasBin: true
+
   keyv@4.5.4:
     resolution: {integrity: sha512-oxVHkHR/EJf2CNXnWxRLW6mg7JyCCUcG0DtEGmL2ctUo1PNTin1PUil+r/+4r5MpVgC/fn1kjsx7mjSujKqIpw==}
 
@@ -2975,6 +2997,9 @@ packages:
 
   ohash@2.0.11:
     resolution: {integrity: sha512-RdR9FQrFwNBNXAr4GixM8YaRZRJ5PUWbKYbE5eOsrwAjJW0q2REGcf79oYPsLyskQCZG1PLN+S/K1V00joZAoQ==}
+
+  ollama@0.6.3:
+    resolution: {integrity: sha512-KEWEhIqE5wtfzEIZbDCLH51VFZ6Z3ZSa6sIOg/E/tBV8S51flyqBOXi+bRxlOYKDf8i327zG9eSTb8IJxvm3Zg==}
 
   on-change@6.0.2:
     resolution: {integrity: sha512-08+12qcOVEA0fS9g/VxKS27HaT94nRutUT77J2dr8zv/unzXopvhBuF8tNLWsoLQ5IgrQ6eptGeGqUYat82U1w==}
@@ -4145,6 +4170,9 @@ packages:
 
   webpack-virtual-modules@0.6.2:
     resolution: {integrity: sha512-66/V2i5hQanC51vBQKPH4aI8NMAcBW59FVBs+rC7eGHupMyfn34q7rZIE+ETlJ+XTevqfUhVVBgSUNSW2flEUQ==}
+
+  whatwg-fetch@3.6.20:
+    resolution: {integrity: sha512-EqhiFU6daOA8kpjOWTL0olhVOF3i7OrFzSYiGsEMB8GcXS+RrzauAERX65xMeNWVqxA6HXH2m69Z9LaKKdisfg==}
 
   whatwg-url@5.0.0:
     resolution: {integrity: sha512-saE57nupxk6v3HY35+jzBwYa0rKSy0XR8JSxZPwgLr7ys0IBzhGviA1/TUGJLmSVqs8pb9AnvICXEuOHLprYTw==}
@@ -5857,6 +5885,16 @@ snapshots:
 
   agent-base@7.1.4: {}
 
+  ai-sdk-ollama@4.1.0(ai@7.0.58(zod@3.25.76))(zod@3.25.76):
+    dependencies:
+      '@ai-sdk/provider': 4.0.7
+      '@ai-sdk/provider-utils': 5.0.25(zod@3.25.76)
+      ai: 7.0.58(zod@3.25.76)
+      jsonrepair: 3.15.0
+      ollama: 0.6.3
+    transitivePeerDependencies:
+      - zod
+
   ai@7.0.58(zod@3.25.76):
     dependencies:
       '@ai-sdk/gateway': 4.0.46(zod@3.25.76)
@@ -6779,6 +6817,8 @@ snapshots:
 
   json5@2.2.3: {}
 
+  jsonrepair@3.15.0: {}
+
   keyv@4.5.4:
     dependencies:
       json-buffer: 3.0.1
@@ -7442,6 +7482,10 @@ snapshots:
   ofetch@2.0.0-alpha.3: {}
 
   ohash@2.0.11: {}
+
+  ollama@0.6.3:
+    dependencies:
+      whatwg-fetch: 3.6.20
 
   on-change@6.0.2: {}
 
@@ -8589,6 +8633,8 @@ snapshots:
   webidl-conversions@3.0.1: {}
 
   webpack-virtual-modules@0.6.2: {}
+
+  whatwg-fetch@3.6.20: {}
 
   whatwg-url@5.0.0:
     dependencies:
