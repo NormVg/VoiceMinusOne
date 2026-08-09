@@ -223,18 +223,13 @@ stateDiagram-v2
 | `@voiceminusone/core` | Frame types, FrameProcessor, Pipeline, plugin interfaces, errors, logger, clock |
 | `@voiceminusone/server` | SessionManager, wire protocol (zod-validated), WebSocket transport |
 | `@voiceminusone/client` | Mic (AudioWorklet), Speaker (prebuffered gapless), EnergyVAD, VoiceMinusOneClient |
-| `@voiceminusone/test-pipeline` | Automated end-to-end test from an audio file |
-
-### Planned packages
-
-| Package | Description |
-|---------|-------------|
-| `@voiceminusone/transport-ably` | Ably pub/sub transport |
-| `@voiceminusone/provider-sarvam` | Sarvam STT (Saaras v3) + TTS (Bulbul v3) |
-| `@voiceminusone/adapter-ai-sdk` | Vercel AI SDK 7 → Brain adapter |
-| `@voiceminusone/vad-silero` | Silero VAD via ONNX Runtime Web |
+| `@voiceminusone/provider-sarvam` | Sarvam STT (Saaras v3, WebSocket streaming) + TTS (Bulbul v3, HTTP streaming) |
+| `@voiceminusone/adapter-ai-sdk` | Vercel AI SDK 7 → Brain adapter (streaming + complete modes) |
+| `@voiceminusone/transport-ably` | Ably pub/sub transport (binary extras, not base64) |
+| `@voiceminusone/vad-silero` | Silero VAD via ONNX Runtime Web (WASM) |
 | `@voiceminusone/vad-energy` | Energy-based VAD (zero-dependency fallback) |
-| `@voiceminusone/nuxt` | Nuxt v4 server module |
+| `@voiceminusone/nuxt` | Nuxt v4 server module (crossws WebSocket handler) |
+| `@voiceminusone/test-pipeline` | Automated end-to-end test from an audio file |
 
 ## Quick start
 

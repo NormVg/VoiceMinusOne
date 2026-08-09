@@ -462,35 +462,35 @@ Three reference repos are cloned under `.info/repo/` with distilled guides under
 
 ## Implementation Phases
 
-### Phase 1: Foundation (current)
-- [ ] Monorepo setup (pnpm workspace, tsconfig.base.json, biome.json, tsup)
-- [ ] `@voiceminusone/core` — Frame types, FrameProcessor, Pipeline, plugin interfaces, errors, logger, clock
-- [ ] `@voiceminusone/core` tests (Vitest)
+### Phase 1: Foundation ✅
+- [x] Monorepo setup (pnpm workspace, tsconfig.base.json, biome.json, tsup)
+- [x] `@voiceminusone/core` — Frame types, FrameProcessor, Pipeline, plugin interfaces, errors, logger, clock
+- [x] `@voiceminusone/core` tests (Vitest)
 
-### Phase 2: Server & Client Core
-- [ ] `@voiceminusone/server` — Session (split components), session manager, pipeline runner
-- [ ] `@voiceminusone/client` — MicdropClient, mic (AudioWorklet), speaker (prebuffered gapless), VAD three-phase state machine
-- [ ] `MemoryTransport` for testing
-- [ ] Integration tests with real WebSocket
+### Phase 2: Server & Client Core ✅
+- [x] `@voiceminusone/server` — Session (split components), session manager, pipeline runner
+- [x] `@voiceminusone/client` — MicdropClient, mic (AudioWorklet), speaker (prebuffered gapless), VAD three-phase state machine
+- [x] `MemoryTransport` for testing
+- [x] Integration tests with real WebSocket
 
-### Phase 3: Transports
-- [ ] `@voiceminusone/transport-ws` — WebSocket transport (client + server), crossws adapter for Nuxt/Nitro
-- [ ] `@voiceminusone/transport-ably` — Ably pub/sub transport (binary extras, not base64)
-- [ ] Transport tests
+### Phase 3: Transports ✅
+- [x] `@voiceminusone/server` WebSocket transport (client + server), crossws adapter for Nuxt/Nitro
+- [x] `@voiceminusone/transport-ably` — Ably pub/sub transport (binary extras, not base64)
+- [x] Transport tests
 
-### Phase 4: Providers
-- [ ] `@voiceminusone/provider-sarvam` — Sarvam STT (Saaras v3, WebSocket streaming) + TTS (Bulbul v3, HTTP streaming)
-- [ ] `@voiceminusone/adapter-ai-sdk` — Vercel AI SDK 7 → Brain adapter
-- [ ] `@voiceminusone/vad-silero` — Silero VAD via ONNX Runtime Web
-- [ ] `@voiceminusone/vad-energy` — Energy-based VAD fallback
-- [ ] Provider tests
+### Phase 4: Providers ✅
+- [x] `@voiceminusone/provider-sarvam` — Sarvam STT (Saaras v3, WebSocket streaming) + TTS (Bulbul v3, HTTP streaming)
+- [x] `@voiceminusone/adapter-ai-sdk` — Vercel AI SDK 7 → Brain adapter
+- [x] `@voiceminusone/vad-silero` — Silero VAD via ONNX Runtime Web
+- [x] `@voiceminusone/vad-energy` — Energy-based VAD fallback
+- [x] Provider tests
 
-### Phase 5: Nuxt Integration
-- [ ] `@voiceminusone/nuxt` — Nuxt v4 server module (crossws WebSocket handler, session management)
-- [ ] Example: Nuxt v4 + WS + Sarvam + AI SDK
-- [ ] Example: Nuxt v4 + Ably + Sarvam + AI SDK
+### Phase 5: Nuxt Integration ✅
+- [x] `@voiceminusone/nuxt` — Nuxt v4 server module (crossws WebSocket handler, session management)
+- [x] Example: Nuxt v4 + WS + mock providers
+- [ ] Example: Nuxt v4 + WS + Sarvam + AI SDK (needs API keys)
 
-### Phase 6: Polish & Release
+### Phase 6: Polish & Release (current)
 - [ ] Reconnection logic with backoff
 - [ ] Backpressure on all sends
 - [ ] Observability (telemetry middleware, metrics)
