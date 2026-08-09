@@ -113,6 +113,30 @@ export const StateEvent = z.object({
 })
 export type StateEvent = z.infer<typeof StateEvent>
 
+export const TurnStatsEvent = z.object({
+  type: z.literal('turn_stats'),
+  turnId: z.number(),
+  /** Time from turn start to STT result (ms) */
+  sttMs: z.number(),
+  /** Time the LLM took to produce all text (ms) */
+  brainMs: z.number(),
+  /** Time from turn start to first audio chunk sent (ms) */
+  firstAudioMs: z.number(),
+  /** Total TTS synthesis time (ms) */
+  ttsMs: z.number(),
+  /** Total turn wall-clock time (ms) */
+  totalMs: z.number(),
+  /** Number of sentences synthesized */
+  sentences: z.number(),
+  /** User transcript (truncated) */
+  transcript: z.string(),
+  /** Bot response (truncated) */
+  response: z.string(),
+  /** Whether the turn was interrupted */
+  interrupted: z.boolean(),
+})
+export type TurnStatsEvent = z.infer<typeof TurnStatsEvent>
+
 export const ServerToClientEventSchema = z.discriminatedUnion('type', [
   MessageEvent,
   TranscriptEvent,
@@ -122,6 +146,7 @@ export const ServerToClientEventSchema = z.discriminatedUnion('type', [
   ToolCallEvent,
   ErrorEvent,
   StateEvent,
+  TurnStatsEvent,
 ])
 
 export type ServerToClientEvent =
@@ -135,6 +160,7 @@ export type ServerToClientEvent =
   | ToolCallEvent
   | ErrorEvent
   | StateEvent
+  | TurnStatsEvent
 
 // --- Validation helpers ---
 

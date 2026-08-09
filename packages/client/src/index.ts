@@ -21,4 +21,4 @@ export { EnergyVAD, VADStatus, DEFAULT_VAD_CONFIG } from './vad/energy-vad'
 export type { VADConfig, VADEvent, VADEventType, VADEventListener } from './vad/energy-vad'
 
 export { VoiceMinusOneClient, DEFAULT_CLIENT_CONFIG } from './client/voice-client'
-export type { ClientConfig, ClientState, ClientStateListener, TranscriptListener, BotTextListener, BotTextDoneListener } from './client/voice-client'
+export type { ClientConfig, ClientState, ClientStateListener, TranscriptListener, BotTextListener, BotTextDoneListener, TurnStats, TurnStatsListener } from './client/voice-client'

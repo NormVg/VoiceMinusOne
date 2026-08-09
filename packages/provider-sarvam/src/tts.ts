@@ -104,13 +104,14 @@ export class SarvamTTS implements TTSProvider {
   }
 
   /**
-   * Synthesize text to audio via WebSocket streaming.
+   * Synthesize text to audio.
    *
-   * Opens a WebSocket connection to the Sarvam TTS endpoint, sends a config
-   * message, then the text, then a flush signal. Audio chunks arrive as
-   * base64-encoded messages and are yielded as AudioChunk.
+   * Uses REST by default — it's faster per-sentence than WebSocket
+   * because there's no connection overhead. The WebSocket path opens
+   * a new connection per call, adding ~1s latency per sentence.
    *
-   * Falls back to REST if WebSocket is unavailable.
+   * Set `streaming: true` in options to use WebSocket streaming instead
+   * (better for long text on a persistent connection).
    */
   async *synthesize(
     text: string,
@@ -123,7 +124,7 @@ export class SarvamTTS implements TTSProvider {
     this.activeControllers.add(controller)
     const signal = controller.signal
 
-    const sampleRate = this.options.sampleRate ?? 16000
+    const sampleRate = this.options.sampleRate ?? 22050
     const numChannels = 1
     const speaker = config.speaker ?? this.options.speaker ?? 'shubh'
     const language = config.language ?? this.options.language ?? 'en-IN'
@@ -131,7 +132,8 @@ export class SarvamTTS implements TTSProvider {
     const pace = config.pace ?? this.options.pace ?? 1.0
 
     try {
-      yield* this.synthesizeWs(trimmed, {
+      // REST is faster for sentence-level synthesis (no WS connection overhead)
+      yield* this.synthesizeRest(trimmed, {
         speaker,
         language,
         model,
@@ -144,9 +146,9 @@ export class SarvamTTS implements TTSProvider {
       if (signal.aborted) return
       this.ctx?.logger.warn(
         'sarvam-tts',
-        `WebSocket synthesis failed: ${(err as Error).message}. Falling back to REST.`,
+        `REST synthesis failed: ${(err as Error).message}. Trying WebSocket.`,
       )
-      yield* this.synthesizeRest(trimmed, {
+      yield* this.synthesizeWs(trimmed, {
         speaker,
         language,
         model,
@@ -321,7 +323,12 @@ export class SarvamTTS implements TTSProvider {
     void configSent
   }
 
-  /** REST fallback synthesis. */
+  /** REST synthesis — uses the streaming HTTP endpoint for lower latency.
+   *
+   *  The /text-to-speech/stream endpoint returns raw binary audio as a
+   *  stream (no base64, no JSON parsing). Audio starts arriving as soon
+   *  as the first chunk is synthesized.
+   */
   private async *synthesizeRest(
     text: string,
     opts: {
@@ -341,9 +348,10 @@ export class SarvamTTS implements TTSProvider {
       speaker: opts.speaker,
       pace: opts.pace,
       speech_sample_rate: String(opts.sampleRate),
+      output_audio_codec: 'wav',
     }
 
-    const res = await fetch(`${this.baseUrl}/text-to-speech`, {
+    const res = await fetch(`${this.baseUrl}/text-to-speech/stream`, {
       method: 'POST',
       headers: {
         ...authHeaders(this.apiKey),
@@ -358,17 +366,49 @@ export class SarvamTTS implements TTSProvider {
       throw new PluginError('TTS_FAILED', `Sarvam TTS ${res.status}: ${errBody}`)
     }
 
-    const json = (await res.json()) as { audios?: string[] }
-    const b64 = json.audios?.[0]
-    if (!b64) return
+    // Stream the binary audio response
+    if (!res.body) {
+      // Fallback: read full response as arraybuffer
+      const buf = await res.arrayBuffer()
+      const pcm = stripWavHeader(buf)
+      if (pcm.byteLength > 0) {
+        yield { data: pcm, sampleRate: opts.sampleRate, numChannels: opts.numChannels }
+      }
+      return
+    }
 
-    const data = base64ToArrayBuffer(b64)
-    const pcm = stripWavHeader(data)
+    // Read the stream in chunks
+    const reader = res.body.getReader()
+    const chunks: ArrayBuffer[] = []
+    let totalBytes = 0
 
-    yield {
-      data: pcm,
-      sampleRate: opts.sampleRate,
-      numChannels: opts.numChannels,
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (opts.signal.aborted) break
+
+        chunks.push(value.buffer)
+        totalBytes += value.byteLength
+      }
+    } finally {
+      reader.releaseLock()
+    }
+
+    if (totalBytes === 0) return
+
+    // Concatenate all chunks
+    const combined = new Uint8Array(totalBytes)
+    let offset = 0
+    for (const chunk of chunks) {
+      combined.set(new Uint8Array(chunk), offset)
+      offset += chunk.byteLength
+    }
+
+    // Strip WAV header if present
+    const pcm = stripWavHeader(combined.buffer)
+    if (pcm.byteLength > 0) {
+      yield { data: pcm, sampleRate: opts.sampleRate, numChannels: opts.numChannels }
     }
   }
 

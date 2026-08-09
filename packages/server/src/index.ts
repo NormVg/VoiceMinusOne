@@ -63,4 +63,5 @@ export type {
   ToolCallEvent,
   ErrorEvent,
   StateEvent,
+  TurnStatsEvent,
 } from './wire/protocol'

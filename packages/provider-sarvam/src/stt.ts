@@ -125,14 +125,16 @@ export class SarvamSTT implements STTProvider {
     let idleTimer: ReturnType<typeof setTimeout> | null = null
 
     /** Reset the idle timer. After flush, if no message arrives within
-     *  the timeout, we consider transcription complete and close the socket. */
+     *  the timeout, we consider transcription complete and close the socket.
+     *  Kept short (500ms) because Sarvam sends all transcripts quickly
+     *  after flush — the 3s timeout was adding unnecessary latency. */
     const resetIdleTimer = (): void => {
       if (idleTimer) clearTimeout(idleTimer)
       if (flushSent) {
         idleTimer = setTimeout(() => {
           wsClosed = true
           resolveMessage?.()
-        }, 3000)
+        }, 500)
       }
     }
 

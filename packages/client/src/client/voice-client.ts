@@ -46,6 +46,24 @@ export type TranscriptListener = (text: string, isFinal: boolean) => void
 export type BotTextListener = (text: string, messageId: string) => void
 export type BotTextDoneListener = (messageId: string, partial: boolean) => void
 
+/** Server-reported per-turn timing breakdown. */
+export interface TurnStats {
+  readonly turnId: number
+  readonly sttMs: number
+  readonly brainMs: number
+  readonly firstAudioMs: number
+  readonly ttsMs: number
+  readonly totalMs: number
+  readonly sentences: number
+  readonly transcript: string
+  readonly response: string
+  readonly interrupted: boolean
+  /** Client-measured wall-clock from stop_speaking sent to first audio received. */
+  readonly e2eLatencyMs?: number | undefined
+}
+
+export type TurnStatsListener = (stats: TurnStats) => void
+
 /** Close codes that should NOT trigger reconnection. */
 const NON_RECOVERABLE_CLOSE_CODES = new Set([4000, 4001, 4400, 4401])
 
@@ -68,6 +86,12 @@ export class VoiceMinusOneClient {
   private transcriptListeners: TranscriptListener[] = []
   private botTextListeners: BotTextListener[] = []
   private botTextDoneListeners: BotTextDoneListener[] = []
+  private turnStatsListeners: TurnStatsListener[] = []
+
+  /** Timestamp when stop_speaking was sent — for E2E latency measurement. */
+  private turnStartTime: number | null = null
+  /** Client-measured E2E latency (stop_speaking → first audio chunk). */
+  private e2eLatencyMs: number | null = null
 
   private micChunkUnsub: (() => void) | null = null
   private micStateUnsub: (() => void) | null = null
@@ -166,6 +190,8 @@ export class VoiceMinusOneClient {
         // After the audio is sent, signal stop_speaking so the server
         // runs the STT → Brain → TTS pipeline on this utterance
         this.speaking = false
+        this.turnStartTime = Date.now()
+        this.e2eLatencyMs = null
         this.sendEvent({ type: 'stop_speaking' })
         this.notifyState()
       }
@@ -259,6 +285,15 @@ export class VoiceMinusOneClient {
     }
   }
 
+  /** Subscribe to per-turn timing stats from the server. */
+  onTurnStats(listener: TurnStatsListener): () => void {
+    this.turnStatsListeners.push(listener)
+    return () => {
+      const idx = this.turnStatsListeners.indexOf(listener)
+      if (idx >= 0) this.turnStatsListeners.splice(idx, 1)
+    }
+  }
+
   // --- Internal ---
 
   /** Handle an incoming WebSocket message. */
@@ -269,6 +304,10 @@ export class VoiceMinusOneClient {
       this.handleEvent(event.data)
     } else if (event.data instanceof ArrayBuffer) {
       // Binary frame — audio
+      // Measure E2E latency on first audio chunk of this turn
+      if (this.turnStartTime !== null && this.e2eLatencyMs === null) {
+        this.e2eLatencyMs = Date.now() - this.turnStartTime
+      }
       this.speaker.feed(event.data)
     }
   }
@@ -303,6 +342,29 @@ export class VoiceMinusOneClient {
       case 'audio_flush':
         this.speaker.stop()
         break
+      case 'turn_stats': {
+        const stats: TurnStats = {
+          turnId: event.turnId as number,
+          sttMs: event.sttMs as number,
+          brainMs: event.brainMs as number,
+          firstAudioMs: event.firstAudioMs as number,
+          ttsMs: event.ttsMs as number,
+          totalMs: event.totalMs as number,
+          sentences: event.sentences as number,
+          transcript: event.transcript as string,
+          response: event.response as string,
+          interrupted: event.interrupted as boolean,
+          e2eLatencyMs: this.e2eLatencyMs ?? undefined,
+        }
+        for (const listener of this.turnStatsListeners) {
+          try {
+            listener(stats)
+          } catch {
+            // Listener errors are non-fatal
+          }
+        }
+        break
+      }
       case 'state':
         // Server state update — update listening flag
         if (event.state === 'listening') {

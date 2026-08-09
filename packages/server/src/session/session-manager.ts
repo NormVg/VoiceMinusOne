@@ -231,9 +231,15 @@ export class SessionManager {
    */
   private async runTurn(audioChunks: AudioChunk[]): Promise<void> {
     const { turnId, signal } = this.turnManager.startTurn()
+    const T0 = Date.now()
+    const timings: Record<string, number> = {}
+    const mark = (label: string): void => {
+      timings[label] = Date.now() - T0
+    }
 
     try {
       // 1. STT: audio → transcript
+      mark('start')
       const audioStream = this.chunksToAsyncIterable(audioChunks)
       const transcripts: TranscriptResult[] = []
 
@@ -245,6 +251,7 @@ export class SessionManager {
           isFinal: result.isFinal,
         })
       }
+      mark('stt_done')
 
       const finalTranscript = transcripts.find((t) => t.isFinal)
       if (!finalTranscript || !finalTranscript.text.trim()) {
@@ -256,6 +263,7 @@ export class SessionManager {
 
       // 2. Add to history
       this.history.addUserMessage(finalTranscript.text)
+      mark('history')
 
       // 3. Transition to speaking state
       if (this.stateMachine.canTransition(SessionState.Speaking)) {
@@ -270,6 +278,8 @@ export class SessionManager {
       const messageId = `bot-${turnId}`
       let assistantText = ''
       let sentenceBuffer = ''
+      let firstAudioSent = false
+      let sentenceCount = 0
 
       const brainContext = {
         sessionId: this.sessionId,
@@ -278,15 +288,22 @@ export class SessionManager {
       }
 
       const brainResult = this.brain(finalTranscript.text, brainContext)
+      mark('brain_start')
 
       // Helper: flush a sentence to TTS and send audio to client
       const flushSentence = async (text: string): Promise<void> => {
         const trimmed = text.trim()
         if (!trimmed) return
+        sentenceCount++
         try {
           for await (const chunk of this.audioRouter.synthesizeChunks(trimmed)) {
             if (signal.aborted) return
             this.transport.sendAudio(chunk.data)
+            if (!firstAudioSent) {
+              firstAudioSent = true
+              mark('first_audio')
+              this.logger.info('session', `⏱️ FIRST AUDIO at ${timings.first_audio}ms (sentence ${sentenceCount})`)
+            }
           }
         } catch (err) {
           this.logger.warn('session', `TTS error for sentence: ${(err as Error).message}`)
@@ -313,11 +330,13 @@ export class SessionManager {
         this.sendEvent({ type: 'bot_text', text: assistantText, messageId })
         sentenceBuffer = assistantText
       }
+      mark('brain_done')
 
       // Flush any remaining text
       if (!signal.aborted && sentenceBuffer.trim()) {
         await flushSentence(sentenceBuffer)
       }
+      mark('tts_done')
 
       // Signal text done
       this.sendEvent({ type: 'bot_text_done', messageId, partial: signal.aborted })
@@ -326,6 +345,39 @@ export class SessionManager {
       this.history.addAssistantMessage(assistantText, {
         id: messageId,
         partial: signal.aborted,
+      })
+
+      // Print timing stats
+      const total = Date.now() - T0
+      const sttMs = (timings.stt_done ?? 0) - (timings.start ?? 0)
+      const brainMs = (timings.brain_done ?? 0) - (timings.brain_start ?? 0)
+      const firstAudioMs = timings.first_audio ?? 0
+      const ttsMs = (timings.tts_done ?? 0) - (timings.brain_start ?? 0)
+      this.logger.info('session', [
+        `⏱️ TURN STATS (turn ${turnId}):`,
+        `  STT:       ${sttMs}ms`,
+        `  Brain:     ${brainMs}ms`,
+        `  First aud: ${firstAudioMs}ms  ← time-to-first-audio`,
+        `  TTS total: ${ttsMs}ms`,
+        `  Total:     ${total}ms`,
+        `  Sentences: ${sentenceCount}`,
+        `  Transcript: "${finalTranscript.text.substring(0, 60)}"`,
+        `  Response:  "${assistantText.substring(0, 60)}"`,
+      ].join('\n'))
+
+      // Send stats to the client so the UI can display them
+      this.sendEvent({
+        type: 'turn_stats',
+        turnId,
+        sttMs,
+        brainMs,
+        firstAudioMs,
+        ttsMs,
+        totalMs: total,
+        sentences: sentenceCount,
+        transcript: finalTranscript.text.substring(0, 120),
+        response: assistantText.substring(0, 120),
+        interrupted: signal.aborted,
       })
 
       this.turnManager.endTurn(false)
