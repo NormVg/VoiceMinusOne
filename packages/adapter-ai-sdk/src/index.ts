@@ -100,15 +100,21 @@ export function aiSdkBrain(options: AiSdkBrainOptions): Brain {
 
     const messages = buildMessages(userText, context.history, options.systemPrompt)
 
-    const result = streamText({
-      model: options.model,
-      system: options.systemPrompt,
-      messages,
-      temperature: options.temperature ?? 0.7,
-      maxTokens: options.maxTokens,
-      abortSignal: context.signal,
-    })
+    let result: StreamTextResultLike
+    try {
+      result = streamText({
+        model: options.model,
+        system: options.systemPrompt,
+        messages,
+        temperature: options.temperature ?? 0.7,
+        maxTokens: options.maxTokens,
+        abortSignal: context.signal,
+      })
+    } catch (err) {
+      throw err
+    }
 
+    // Consume the textStream — errors from the HTTP request surface here
     for await (const textPart of result.textStream) {
       if (context.signal.aborted) break
       yield textPart

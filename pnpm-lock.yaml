@@ -168,9 +168,21 @@ importers:
 
   packages/test-pipeline:
     dependencies:
+      '@ai-sdk/openai-compatible':
+        specifier: ^3.0.27
+        version: 3.0.27(zod@3.25.76)
+      '@voiceminusone/adapter-ai-sdk':
+        specifier: workspace:*
+        version: link:../adapter-ai-sdk
       '@voiceminusone/core':
         specifier: workspace:*
         version: link:../core
+      '@voiceminusone/provider-sarvam':
+        specifier: workspace:*
+        version: link:../provider-sarvam
+      ai:
+        specifier: ^7.0.58
+        version: 7.0.58(zod@3.25.76)
     devDependencies:
       tsx:
         specifier: ^4.19.2
@@ -243,6 +255,12 @@ packages:
 
   '@ai-sdk/gateway@4.0.46':
     resolution: {integrity: sha512-LIAO6kAG8fpXQb9L0iwPk1FIbXftvqnyC56v5NEAzeWTeL8fUsy/Hx86VPBTWEDFdwbVprjWifJOAqS6AOj3mA==}
+    engines: {node: '>=22'}
+    peerDependencies:
+      zod: ^3.25.76 || ^4.1.8
+
+  '@ai-sdk/openai-compatible@3.0.27':
+    resolution: {integrity: sha512-icGSoBDbFKZotUwehg7h/JjtD7arweeKfeDcsT9UsPY+YdwiT94JciD59bqAOAdNA3wlS+klW2vsaVLxTUUhbA==}
     engines: {node: '>=22'}
     peerDependencies:
       zod: ^3.25.76 || ^4.1.8
@@ -4225,6 +4243,12 @@ snapshots:
       '@ai-sdk/provider': 4.0.7
       '@ai-sdk/provider-utils': 5.0.25(zod@3.25.76)
       '@vercel/oidc': 3.2.0
+      zod: 3.25.76
+
+  '@ai-sdk/openai-compatible@3.0.27(zod@3.25.76)':
+    dependencies:
+      '@ai-sdk/provider': 4.0.7
+      '@ai-sdk/provider-utils': 5.0.25(zod@3.25.76)
       zod: 3.25.76
 
   '@ai-sdk/provider-utils@5.0.25(zod@3.25.76)':

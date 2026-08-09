@@ -6,10 +6,15 @@
   "type": "module",
   "scripts": {
     "test:audio": "node --experimental-strip-types src/run.ts",
-    "test:audio:dev": "tsx src/run.ts"
+    "test:audio:dev": "tsx src/run.ts",
+    "test:real": "node --experimental-strip-types src/run-real.ts"
   },
   "dependencies": {
-    "@voiceminusone/core": "workspace:*"
+    "@ai-sdk/openai-compatible": "^3.0.27",
+    "@voiceminusone/adapter-ai-sdk": "workspace:*",
+    "@voiceminusone/core": "workspace:*",
+    "@voiceminusone/provider-sarvam": "workspace:*",
+    "ai": "^7.0.58"
   },
   "devDependencies": {
     "tsx": "^4.19.2",
