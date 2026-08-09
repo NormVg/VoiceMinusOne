@@ -29,14 +29,185 @@ const session = createVoiceSession({
 
 **Hybrid pipeline**: Frame-based core (inspired by pipecat) with stream adapters at provider boundaries (inspired by micdrop). Data flows as typed Frames through a directional pipeline — downstream for normal data, upstream for errors and interruptions. Providers implement simple async iterables that the framework adapts to frames.
 
+### Pipeline data flow
+
+```mermaid
+graph LR
+    subgraph Client["Browser Client"]
+        MIC["Mic<br/>(AudioWorklet)"]
+        SPK["Speaker<br/>(Prebuffered)"]
+        VAD["EnergyVAD<br/>(3-phase)"]
+    end
+
+    subgraph Transport["WebSocket Transport"]
+        TIN["Transport Input"]
+        TOUT["Transport Output"]
+    end
+
+    subgraph Server["Server Pipeline"]
+        STT["STT Plugin<br/>(Sarvam Saaras)"]
+        LLM["Brain / LLM<br/>(AI SDK 7)"]
+        TTS["TTS Plugin<br/>(Sarvam Bulbul)"]
+    end
+
+    MIC -->|"PCM 16kHz binary"| TIN
+    VAD -.->|"start/stop speaking"| TIN
+    TIN -->|"AudioRawFrame"| STT
+    STT -->|"TranscriptFrame"| LLM
+    LLM -->|"LLMTextFrame"| TTS
+    TTS -->|"TTSAudioRawFrame"| TOUT
+    TOUT -->|"PCM binary"| SPK
+
+    STT -.->|"InterruptionFrame"| TIN
+    TTS -.->|"ErrorFrame"| TIN
+
+    style Client fill:#1a1a2e,color:#e0e0e0
+    style Transport fill:#16213e,color:#e0e0e0
+    style Server fill:#0f3460,color:#e0e0e0
 ```
-                    DOWNSTREAM →
-┌──────────┐    ┌─────┐    ┌─────┐    ┌─────┐    ┌──────────┐
-│ Transport │───→│ STT │───→│ LLM │───→│ TTS │───→│ Transport│
-│  Input    │    └─────┘    └─────┘    └─────┘    │  Output  │
-└──────────┘                                    └──────────┘
-                    ← UPSTREAM
-              (errors, interruptions)
+
+### Session architecture (no god classes)
+
+```mermaid
+graph TB
+    subgraph SessionManager["SessionManager (coordinator)"]
+        SM["SessionManager"]
+    end
+
+    subgraph Components["Focused Components"]
+        SSM["SessionStateMachine<br/>idle, connected, listening,<br/>receiving, processing, speaking"]
+        TM["TurnManager<br/>turn-taking, interruption,<br/>serial TTS queue"]
+        AR["AudioRouter<br/>transport, STT, TTS<br/>audio buffering"]
+        HM["HistoryManager<br/>conversation messages,<br/>partial updates"]
+    end
+
+    subgraph Plugins["Plugins (swappable)"]
+        STT["STTProvider"]
+        TTS["TTSProvider"]
+        BRAIN["Brain"]
+        VAD["VADProvider"]
+        TRANS["Transport"]
+    end
+
+    SM --> SSM
+    SM --> TM
+    SM --> AR
+    SM --> HM
+
+    AR --> STT
+    AR --> TTS
+    TM --> BRAIN
+    SM --> TRANS
+
+    style SessionManager fill:#0f3460,color:#e0e0e0
+    style Components fill:#16213e,color:#e0e0e0
+    style Plugins fill:#1a1a2e,color:#e0e0e0
+```
+
+### Session state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Connected: transport.connect()
+    Connected --> Listening: startListening()
+    Listening --> Receiving: start_speaking
+    Receiving --> Processing: stop_speaking
+    Processing --> Speaking: TTS starts
+    Speaking --> Listening: TTS done
+    Receiving --> Processing: stop_speaking (no speech)
+    Processing --> Listening: error / empty transcript
+    Listening --> Receiving: start_speaking (barge-in)
+    Speaking --> Receiving: start_speaking (interruption)
+    Connected --> Closed: disconnect()
+    Listening --> Closed: disconnect()
+    Speaking --> Closed: disconnect()
+```
+
+### Turn lifecycle
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant T as Transport
+    participant S as SessionManager
+    participant STT as STTProvider
+    participant B as Brain
+    participant TTS as TTSProvider
+
+    C->>T: start_speaking (event)
+    T->>S: handleStartSpeaking()
+    S->>S: interruptTurn() if active
+
+    C->>T: audio chunks (binary)
+    T->>S: buffer audio
+
+    C->>T: stop_speaking (event)
+    T->>S: handleStopSpeaking()
+    S->>STT: transcribe(audio)
+    STT-->>S: TranscriptResult (final)
+    S->>B: brain(transcript, context)
+    B-->>S: token stream
+    S->>C: bot_text events
+    S->>TTS: synthesize(response)
+    TTS-->>S: audio chunks
+    S->>C: audio (binary)
+    S->>C: bot_text_done
+    S->>S: backToListening()
+```
+
+### Package dependency graph
+
+```mermaid
+graph TB
+    CORE["@voiceminusone/core<br/>frames, pipeline, interfaces"]
+
+    SERVER["@voiceminusone/server<br/>session, wire protocol, WS transport"]
+    CLIENT["@voiceminusone/client<br/>mic, speaker, VAD, client"]
+
+    TRANSPORT_WS["transport-ws<br/>(planned)"]
+    TRANSPORT_ABLY["transport-ably<br/>(planned)"]
+    PROVIDER_SARVAM["provider-sarvam<br/>(planned)"]
+    ADAPTER_AI_SDK["adapter-ai-sdk<br/>(planned)"]
+    VAD_SILERO["vad-silero<br/>(planned)"]
+    VAD_ENERGY["vad-energy<br/>(planned)"]
+    NUXT["nuxt<br/>(planned)"]
+
+    TEST_PIPELINE["test-pipeline<br/>audio file testing"]
+    EXAMPLE["example-nuxt<br/>Nuxt v4 demo app"]
+
+    CORE --> SERVER
+    CORE --> CLIENT
+    CORE --> TRANSPORT_WS
+    CORE --> TRANSPORT_ABLY
+    CORE --> PROVIDER_SARVAM
+    CORE --> ADAPTER_AI_SDK
+    CORE --> VAD_SILERO
+    CORE --> VAD_ENERGY
+
+    SERVER --> NUXT
+    CLIENT --> EXAMPLE
+    SERVER --> EXAMPLE
+
+    CORE --> TEST_PIPELINE
+    SERVER --> TEST_PIPELINE
+
+    style CORE fill:#e94560,color:#fff
+    style SERVER fill:#0f3460,color:#e0e0e0
+    style CLIENT fill:#0f3460,color:#e0e0e0
+    style EXAMPLE fill:#16213e,color:#e0e0e0
+```
+
+### VAD three-phase state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> Silence
+    Silence --> MaybeSpeaking: energy > threshold
+    MaybeSpeaking --> Speaking: sustained for confirmDuration
+    MaybeSpeaking --> Silence: silence for cancelDuration
+    Speaking --> Silence: silence for stopDuration
+    Speaking --> MaybeSpeaking: energy spike (new utterance)
 ```
 
 **No god classes.** The session is split into focused, independently testable components:
