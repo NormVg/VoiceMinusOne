@@ -30,10 +30,10 @@ export interface VADConfig {
 }
 
 export const DEFAULT_VAD_CONFIG: VADConfig = {
-  energyThreshold: 0.015,
-  confirmDurationMs: 80,
-  stopDurationMs: 500,
-  cancelDurationMs: 200,
+  energyThreshold: 0.005,
+  confirmDurationMs: 50,
+  stopDurationMs: 700,
+  cancelDurationMs: 300,
 }
 
 export type VADEventType =

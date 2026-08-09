@@ -1,72 +1,48 @@
 import { WebSocketServer, SessionManager } from '@voiceminusone/server'
 import type {
-  STTProvider,
-  TTSProvider,
-  Brain,
-  AudioChunk,
-  TranscriptResult,
-  STTConfig,
-  TTSConfig,
   PluginContext,
 } from '@voiceminusone/core'
+import { SarvamSTT, SarvamTTS } from '@voiceminusone/provider-sarvam'
+import { aiSdkBrain } from '@voiceminusone/adapter-ai-sdk'
+import { ollama } from 'ai-sdk-ollama'
 
-// --- Mock STT ---
+// --- Real providers ---
 
-class MockSTT implements STTProvider {
-  readonly name = 'mock-stt'
-  async init(_ctx: PluginContext): Promise<void> {}
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  async destroy(): Promise<void> {}
+const SARVAM_API_KEY = process.env.SARVAM_API_KEY!
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY!
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? 'gemma4:31b-cloud'
 
-  async *transcribe(
-    audio: AsyncIterable<AudioChunk>,
-    _config: STTConfig,
-  ): AsyncIterable<TranscriptResult> {
-    let count = 0
-    for await (const _chunk of audio) {
-      count++
-    }
-    yield {
-      text: `Hello from mock STT (${count} chunks received)`,
-      isFinal: true,
-      timestamp: Date.now(),
-    }
-  }
+// The ai-sdk-ollama package reads OLLAMA_API_KEY from process.env
+// to authenticate with ollama.com cloud.
+process.env.OLLAMA_API_KEY = OLLAMA_API_KEY
+
+function createSTT() {
+  return new SarvamSTT({
+    apiKey: SARVAM_API_KEY,
+    language: 'en-IN',
+    model: 'saaras:v3',
+    streaming: true,
+  })
 }
 
-// --- Mock TTS ---
-
-class MockTTS implements TTSProvider {
-  readonly name = 'mock-tts'
-  async init(_ctx: PluginContext): Promise<void> {}
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  async destroy(): Promise<void> {}
-
-  async *synthesize(text: string, _config: TTSConfig): AsyncIterable<AudioChunk> {
-    const words = text.split(/\s+/).filter(Boolean)
-    for (const _word of words) {
-      const buf = new ArrayBuffer(4800)
-      const view = new Int16Array(buf)
-      for (let i = 0; i < 2400; i++) {
-        view[i] = Math.floor(Math.random() * 20) - 10
-      }
-      yield { data: buf, sampleRate: 24000, numChannels: 1 }
-    }
-  }
+function createTTS() {
+  return new SarvamTTS({
+    apiKey: SARVAM_API_KEY,
+    speaker: 'shubh',
+    language: 'en-IN',
+    model: 'bulbul:v3',
+    sampleRate: 22050,
+  })
 }
 
-// --- Mock Brain ---
-
-const mockBrain: Brain = async function* (
-  userText: string,
-): AsyncGenerator<string, void, unknown> {
-  const response = `I heard you say: ${userText}. This is a mock response.`
-  for (const word of response.split(/\s+/)) {
-    yield `${word} `
-    await new Promise((r) => setTimeout(r, 10))
-  }
+function createBrain() {
+  const model = ollama(OLLAMA_MODEL)
+  return aiSdkBrain({
+    model,
+    systemPrompt:
+      'You are a helpful voice assistant. Keep responses concise and conversational. Never use markdown.',
+    temperature: 0.7,
+  })
 }
 
 // --- Nuxt server plugin ---
@@ -77,9 +53,9 @@ export default defineNitroPlugin((nitroApp) => {
   wsServer.onConnection((transport) => {
     const session = new SessionManager({
       transport,
-      stt: new MockSTT(),
-      tts: new MockTTS(),
-      brain: mockBrain,
+      stt: createSTT(),
+      tts: createTTS(),
+      brain: createBrain(),
       sampleRate: 16000,
     })
 

@@ -8,12 +8,20 @@ export default defineNuxtConfig({
       '@voiceminusone/core',
       '@voiceminusone/client',
       '@voiceminusone/server',
+      '@voiceminusone/provider-sarvam',
+      '@voiceminusone/adapter-ai-sdk',
     ],
   },
-  // Allow the server plugin to use ws
+  // Allow the server plugin to use ws and provider packages
   nitro: {
     externals: {
-      inline: ['@voiceminusone/core', '@voiceminusone/client', '@voiceminusone/server'],
+      inline: [
+        '@voiceminusone/core',
+        '@voiceminusone/client',
+        '@voiceminusone/server',
+        '@voiceminusone/provider-sarvam',
+        '@voiceminusone/adapter-ai-sdk',
+      ],
     },
   },
 })

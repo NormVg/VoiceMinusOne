@@ -1,18 +1,38 @@
 /**
- * Mic — microphone capture using AudioWorklet (never ScriptProcessorNode).
+ * Mic — microphone capture with Silero VAD.
  *
- * Per R-011: Never use ScriptProcessorNode. Always use AudioWorkletNode.
+ * Uses @ricky0123/vad-web which runs the Silero v5 neural network
+ * model via ONNX Runtime Web (WASM) directly in the browser.
  *
- * Captures audio at 16kHz mono 16-bit PCM, emitting chunks every 100ms.
- * VAD-gated: only captures when VAD detects speech.
+ * The VAD handles:
+ * - Mic capture at 16kHz mono
+ * - Speech detection (start/end)
+ * - Audio chunk emission (only during speech)
  *
- * The AudioWorklet processor code is generated as a string and loaded
- * via a Blob URL — this avoids needing a separate .js file for the
- * worklet processor.
+ * Audio is emitted as raw 16-bit PCM ArrayBuffer at 16kHz.
  */
 
-import { EnergyVAD } from '../vad/energy-vad'
-import type { VADConfig, VADEvent } from '../vad/energy-vad'
+// Type shim for @ricky0123/vad-web — loaded dynamically in browser
+interface MicVADLike {
+  start(): void
+  pause(): void
+  destroy(): void
+}
+
+interface MicVADOptions {
+  positiveSpeechThreshold: number
+  negativeSpeechThreshold: number
+  preSpeechPadFrames: number
+  redemptionFrames: number
+  minSpeechFrames: number
+  submitUserSpeechOnPause: boolean
+  baseAssetPath: string
+  onnxWASMBasePath: string
+  stream: MediaStream
+  onSpeechStart: () => void
+  onSpeechEnd: (audio: Float32Array) => void
+  onVADMisfire: () => void
+}
 
 export interface MicConfig {
   readonly sampleRate: number
@@ -20,8 +40,16 @@ export interface MicConfig {
   readonly echoCancellation: boolean
   readonly noiseSuppression: boolean
   readonly autoGainControl: boolean
-  readonly chunkDurationMs: number
-  readonly vadConfig?: Partial<VADConfig>
+  /** Silero VAD speech start threshold (0-1, default 0.5) */
+  readonly positiveSpeechThreshold: number
+  /** Silero VAD speech end threshold (0-1, default 0.35) */
+  readonly negativeSpeechThreshold: number
+  /** Pre-speech padding in frames (default 1) */
+  readonly preSpeechPadFrames: number
+  /** Redemption frames before ending speech (default 8) */
+  readonly redemptionFrames: number
+  /** Min speech frames before confirming speech (default 3) */
+  readonly minSpeechFrames: number
 }
 
 export const DEFAULT_MIC_CONFIG: MicConfig = {
@@ -30,7 +58,11 @@ export const DEFAULT_MIC_CONFIG: MicConfig = {
   echoCancellation: true,
   noiseSuppression: true,
   autoGainControl: true,
-  chunkDurationMs: 100,
+  positiveSpeechThreshold: 0.5,
+  negativeSpeechThreshold: 0.35,
+  preSpeechPadFrames: 1,
+  redemptionFrames: 8,
+  minSpeechFrames: 3,
 }
 
 export type AudioChunkListener = (chunk: ArrayBuffer) => void
@@ -43,97 +75,29 @@ export interface MicState {
   readonly error?: string
 }
 
-/** PCM processor worklet code — runs in a separate audio thread. */
-const PCM_PROCESSOR_WORKLET = `
-class PcmProcessor extends AudioWorkletProcessor {
-  constructor() {
-    super()
-    this.buffer = []
-    this.targetSampleRate = ${DEFAULT_MIC_CONFIG.sampleRate}
-    this.chunkSamples = Math.floor(this.targetSampleRate * (${DEFAULT_MIC_CONFIG.chunkDurationMs} / 1000))
-    this.processing = false
-  }
-
-  process(inputs) {
-    const input = inputs[0]
-    if (!input || input.length === 0) return true
-    if (!this.processing) return true
-
-    const channel = input[0]
-    if (!channel) return true
-
-    // Resample from device sample rate to target sample rate
-    const deviceRate = sampleRate
-    const ratio = this.targetSampleRate / deviceRate
-    const resampledLength = Math.floor(channel.length * ratio)
-
-    for (let i = 0; i < resampledLength; i++) {
-      const sourceIdx = Math.floor(i / ratio)
-      const sample = channel[sourceIdx] || 0
-      this.buffer.push(sample)
-    }
-
-    // Emit chunks when buffer reaches chunk size
-    while (this.buffer.length >= this.chunkSamples) {
-      const chunk = this.buffer.splice(0, this.chunkSamples)
-      const pcm = new Int16Array(chunk.length)
-      for (let i = 0; i < chunk.length; i++) {
-        const s = Math.max(-1, Math.min(1, chunk[i]))
-        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
-      }
-      this.port.postMessage(pcm.buffer, [pcm.buffer])
-    }
-
-    return true
-  }
-}
-registerProcessor('pcm-processor', PcmProcessor)
-`
-
 export class Mic {
-  private audioContext: AudioContext | null = null
-  private mediaStream: MediaStream | null = null
-  private workletNode: AudioWorkletNode | null = null
-  private sourceNode: MediaStreamAudioSourceNode | null = null
-  private vad: EnergyVAD
   private config: MicConfig
+  private micVAD: MicVADLike | null = null
+  private mediaStream: MediaStream | null = null
 
   private started = false
   private muted = false
   private speaking = false
-  private processing = false
 
   private chunkListeners: AudioChunkListener[] = []
   private stateListeners: MicStateListener[] = []
-  private vadUnsub: (() => void) | null = null
-
-  /** Queued chunks before VAD confirms speech. */
-  private queuedChunks: ArrayBuffer[] = []
 
   constructor(config: Partial<MicConfig> = {}) {
     this.config = { ...DEFAULT_MIC_CONFIG, ...config }
-    this.vad = new EnergyVAD(this.config.vadConfig)
   }
 
-  /** Start the microphone. Requires user gesture (browser security). */
+  /** Start the microphone with Silero VAD. Requires user gesture. */
   async start(): Promise<void> {
     if (this.started) return
-
-    // Create AudioContext
-    const AudioContextClass =
-      globalThis.AudioContext ?? (globalThis as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-    this.audioContext = new AudioContextClass({ sampleRate: 48000 })
-
-    // Load the PCM processor worklet
-    const blob = new Blob([PCM_PROCESSOR_WORKLET], { type: 'application/javascript' })
-    const workletUrl = URL.createObjectURL(blob)
-    await this.audioContext.audioWorklet.addModule(workletUrl)
-    URL.revokeObjectURL(workletUrl)
 
     // Get microphone stream
     this.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        sampleRate: this.config.sampleRate,
         channelCount: this.config.channelCount,
         echoCancellation: this.config.echoCancellation,
         noiseSuppression: this.config.noiseSuppression,
@@ -141,45 +105,50 @@ export class Mic {
       },
     })
 
-    // Create source node
-    this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream)
-
-    // Create worklet node
-    this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-processor')
-    this.sourceNode.connect(this.workletNode)
-
-    // Listen for PCM chunks from the worklet
-    this.workletNode.port.onmessage = (event: MessageEvent) => {
-      this.handlePcmChunk(event.data as ArrayBuffer)
+    // Dynamically import @ricky0123/vad-web (browser-only)
+    const vadModule = (await import('@ricky0123/vad-web')) as unknown as {
+      MicVAD: { new: (opts: Partial<MicVADOptions>) => Promise<MicVADLike> }
     }
 
-    // Subscribe to VAD events
-    this.vadUnsub = this.vad.onEvent((vadEvent) => this.handleVADEvent(vadEvent))
+    this.micVAD = await vadModule.MicVAD.new({
+      positiveSpeechThreshold: this.config.positiveSpeechThreshold,
+      negativeSpeechThreshold: this.config.negativeSpeechThreshold,
+      preSpeechPadFrames: this.config.preSpeechPadFrames,
+      redemptionFrames: this.config.redemptionFrames,
+      minSpeechFrames: this.config.minSpeechFrames,
+      submitUserSpeechOnPause: true,
+      // Use the exact installed versions — CDN version mismatches cause
+      // "t.getValue is not a function" (WASM/JS API mismatch)
+      baseAssetPath: 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/',
+      onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
+      stream: this.mediaStream,
+      onSpeechStart: () => {
+        this.speaking = true
+        this.notifyState()
+      },
+      onSpeechEnd: (audio: Float32Array) => {
+        this.speaking = false
+        // Convert Float32 samples to 16-bit PCM ArrayBuffer
+        const pcm = this.float32ToInt16(audio)
+        this.emitChunk(pcm.buffer as ArrayBuffer)
+        this.notifyState()
+      },
+      onVADMisfire: () => {
+        // False alarm — no speech to emit
+      },
+    })
 
+    this.micVAD.start()
     this.started = true
-    this.processing = true
     this.notifyState()
   }
 
   /** Stop the microphone. */
   stop(): void {
-    this.processing = false
-    this.vad.reset()
-
-    if (this.vadUnsub) {
-      this.vadUnsub()
-      this.vadUnsub = null
-    }
-
-    if (this.workletNode) {
-      this.workletNode.port.onmessage = null
-      this.workletNode.disconnect()
-      this.workletNode = null
-    }
-
-    if (this.sourceNode) {
-      this.sourceNode.disconnect()
-      this.sourceNode = null
+    if (this.micVAD) {
+      this.micVAD.pause()
+      this.micVAD.destroy()
+      this.micVAD = null
     }
 
     if (this.mediaStream) {
@@ -189,14 +158,8 @@ export class Mic {
       this.mediaStream = null
     }
 
-    if (this.audioContext) {
-      void this.audioContext.close()
-      this.audioContext = null
-    }
-
     this.started = false
     this.speaking = false
-    this.queuedChunks = []
     this.notifyState()
   }
 
@@ -209,11 +172,6 @@ export class Mic {
       }
     }
     this.notifyState()
-  }
-
-  /** Get the current VAD instance. */
-  getVAD(): EnergyVAD {
-    return this.vad
   }
 
   /** Subscribe to audio chunks. Returns an unsubscribe function. */
@@ -243,57 +201,14 @@ export class Mic {
     }
   }
 
-  /** Handle a PCM chunk from the AudioWorklet. */
-  private handlePcmChunk(chunk: ArrayBuffer): void {
-    if (!this.processing || this.muted) return
-
-    // Feed to VAD
-    const samples = new Float32Array(chunk.byteLength / 2)
-    const view = new DataView(chunk)
+  /** Convert Float32 audio samples to 16-bit PCM. */
+  private float32ToInt16(samples: Float32Array): Int16Array {
+    const pcm = new Int16Array(samples.length)
     for (let i = 0; i < samples.length; i++) {
-      samples[i] = view.getInt16(i * 2, true) / 0x8000
+      const s = Math.max(-1, Math.min(1, samples[i]!))
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff
     }
-    this.vad.process(samples, Date.now())
-
-    // Queue chunks until VAD confirms speech
-    if (this.speaking) {
-      // Flush any queued chunks first
-      for (const queued of this.queuedChunks) {
-        this.emitChunk(queued)
-      }
-      this.queuedChunks = []
-      this.emitChunk(chunk)
-    } else {
-      // Queue the chunk (will be emitted on confirm, discarded on cancel)
-      this.queuedChunks.push(chunk)
-    }
-  }
-
-  /** Handle a VAD event. */
-  private handleVADEvent(event: VADEvent): void {
-    switch (event.type) {
-      case 'start-speaking':
-        // VAD detected possible speech — start queuing
-        break
-      case 'confirm-speaking':
-        // Speech confirmed — emit queued chunks
-        this.speaking = true
-        for (const queued of this.queuedChunks) {
-          this.emitChunk(queued)
-        }
-        this.queuedChunks = []
-        this.notifyState()
-        break
-      case 'cancel-speaking':
-        // False alarm — discard queued chunks
-        this.queuedChunks = []
-        break
-      case 'stop-speaking':
-        // Speech ended
-        this.speaking = false
-        this.notifyState()
-        break
-    }
+    return pcm
   }
 
   /** Emit a chunk to all listeners. */

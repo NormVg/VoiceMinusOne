@@ -36,9 +36,12 @@ export interface LanguageModelLike {
  */
 export interface StreamTextOptionsLike {
   model: LanguageModelLike
+  /** System prompt. AI SDK v7 renamed this to `instructions`. */
   system?: string | undefined
+  /** System prompt (AI SDK v7+). */
+  instructions?: string | undefined
   messages?: Array<{
-    role: 'system' | 'user' | 'assistant' | 'tool'
+    role: 'user' | 'assistant' | 'tool'
     content: string
   }>
   temperature?: number | undefined
@@ -98,13 +101,13 @@ export function aiSdkBrain(options: AiSdkBrainOptions): Brain {
   return async function* (userText: string, context: BrainContext): AsyncGenerator<string, void, unknown> {
     const streamText = options.streamText ?? (await loadStreamText())
 
-    const messages = buildMessages(userText, context.history, options.systemPrompt)
+    const messages = buildMessages(userText, context.history)
 
     let result: StreamTextResultLike
     try {
       result = streamText({
         model: options.model,
-        system: options.systemPrompt,
+        instructions: options.systemPrompt,
         messages,
         temperature: options.temperature ?? 0.7,
         maxTokens: options.maxTokens,
@@ -130,11 +133,11 @@ export function aiSdkBrainComplete(options: AiSdkBrainOptions): Brain {
   return async (userText: string, context: BrainContext): Promise<string> => {
     const streamText = options.streamText ?? (await loadStreamText())
 
-    const messages = buildMessages(userText, context.history, options.systemPrompt)
+    const messages = buildMessages(userText, context.history)
 
     const result = streamText({
       model: options.model,
-      system: options.systemPrompt,
+      instructions: options.systemPrompt,
       messages,
       temperature: options.temperature ?? 0.7,
       maxTokens: options.maxTokens,
@@ -145,25 +148,21 @@ export function aiSdkBrainComplete(options: AiSdkBrainOptions): Brain {
   }
 }
 
-/** Build the messages array from history + current user text. */
+/** Build the messages array from history + current user text.
+ *
+ *  Per AI SDK v7: system messages are NOT allowed in the messages array.
+ *  System prompts must be passed via the `instructions` option instead.
+ *  This function filters out any system messages from history.
+ */
 function buildMessages(
   userText: string,
   history: ConversationMessage[],
-  systemPrompt?: string,
-): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
-  const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = []
+): Array<{ role: 'user' | 'assistant'; content: string }> {
+  const messages: Array<{ role: 'user' | 'assistant'; content: string }> = []
 
-  // Add system prompt if not already in history
-  if (systemPrompt) {
-    const hasSystemInHistory = history.some((m) => m.role === 'system')
-    if (!hasSystemInHistory) {
-      messages.push({ role: 'system', content: systemPrompt })
-    }
-  }
-
-  // Add history (skip system messages if we already added one)
+  // Add history (skip system messages — they go via `instructions`)
   for (const msg of history) {
-    if (msg.role === 'system' && systemPrompt) continue
+    if (msg.role === 'system') continue
     messages.push({ role: msg.role, content: msg.content })
   }
 

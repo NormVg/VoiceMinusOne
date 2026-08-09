@@ -12,9 +12,13 @@
     "test:browser": "node test/browser-test.mjs"
   },
   "dependencies": {
+    "@voiceminusone/adapter-ai-sdk": "workspace:*",
     "@voiceminusone/client": "workspace:*",
     "@voiceminusone/core": "workspace:*",
+    "@voiceminusone/provider-sarvam": "workspace:*",
     "@voiceminusone/server": "workspace:*",
+    "ai": "^7.0.0",
+    "ai-sdk-ollama": "^4.0.0",
     "nuxt": "^4.5.2",
     "vue": "^3.5.40",
     "vue-router": "^5.2.0",

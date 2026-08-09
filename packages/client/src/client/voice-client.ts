@@ -158,18 +158,24 @@ export class VoiceMinusOneClient {
     await this.mic.start()
     await this.speaker.init()
 
-    // Send audio chunks to server
+    // Send audio chunks to server — chunks arrive as complete speech
+    // utterances (Silero VAD emits on speech end)
     this.micChunkUnsub = this.mic.onChunk((chunk) => {
       if (this.connected && !this.muted) {
         this.ws?.send(chunk) // Binary frame — never base64 (R-010)
+        // After the audio is sent, signal stop_speaking so the server
+        // runs the STT → Brain → TTS pipeline on this utterance
+        this.speaking = false
+        this.sendEvent({ type: 'stop_speaking' })
+        this.notifyState()
       }
     })
 
-    // Listen for VAD state changes
+    // Listen for VAD state changes (start_speaking)
     this.micStateUnsub = this.mic.onStateChange((state) => {
-      if (state.speaking !== this.speaking) {
-        this.speaking = state.speaking
-        this.sendEvent({ type: state.speaking ? 'start_speaking' : 'stop_speaking' })
+      if (state.speaking && !this.speaking) {
+        this.speaking = true
+        this.sendEvent({ type: 'start_speaking' })
         this.notifyState()
       }
     })

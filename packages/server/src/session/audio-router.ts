@@ -105,6 +105,20 @@ export class AudioRouter {
   }
 
   /**
+   * Synthesize text to speech and yield audio chunks.
+   * Used for streaming: each sentence is synthesized independently.
+   */
+  async *synthesizeChunks(
+    text: string,
+    config?: TTSConfig,
+  ): AsyncIterable<AudioChunk> {
+    const ttsConfig = config ?? this.opts.ttsConfig ?? {}
+    for await (const chunk of this.opts.tts.synthesize(text, ttsConfig)) {
+      yield chunk
+    }
+  }
+
+  /**
    * Synthesize text to speech and send audio chunks to transport.
    * Uses the serial TTS queue from TurnManager (caller enqueues).
    */

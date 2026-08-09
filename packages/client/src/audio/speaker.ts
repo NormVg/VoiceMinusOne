@@ -18,7 +18,7 @@ export interface SpeakerConfig {
 }
 
 export const DEFAULT_SPEAKER_CONFIG: SpeakerConfig = {
-  sampleRate: 24000,
+  sampleRate: 22050,
   numChannels: 1,
   prebufferDurationMs: 100,
   quietFlushDelayMs: 600,

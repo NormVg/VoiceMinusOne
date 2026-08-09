@@ -223,7 +223,12 @@ export class SessionManager {
     await this.runTurn(audioChunks)
   }
 
-  /** Run a full turn: STT → Brain → TTS. */
+  /** Run a full turn: STT → Brain → TTS.
+   *
+   *  Streaming pipeline: LLM tokens are accumulated into sentence-sized
+   *  chunks and sent to TTS immediately — TTS starts generating audio
+   *  while the LLM is still producing text. This minimizes time-to-first-audio.
+   */
   private async runTurn(audioChunks: AudioChunk[]): Promise<void> {
     const { turnId, signal } = this.turnManager.startTurn()
 
@@ -252,9 +257,19 @@ export class SessionManager {
       // 2. Add to history
       this.history.addUserMessage(finalTranscript.text)
 
-      // 3. Brain: transcript → response
+      // 3. Transition to speaking state
+      if (this.stateMachine.canTransition(SessionState.Speaking)) {
+        this.stateMachine.transition(SessionState.Speaking)
+        this.sendEvent({ type: 'state', state: this.stateMachine.state })
+      }
+
+      // 4. Brain → TTS streaming pipeline
+      // Accumulate LLM tokens into sentence-sized chunks and send each
+      // to TTS immediately. This starts audio playback while the LLM
+      // is still generating, minimizing time-to-first-audio.
       const messageId = `bot-${turnId}`
       let assistantText = ''
+      let sentenceBuffer = ''
 
       const brainContext = {
         sessionId: this.sessionId,
@@ -264,57 +279,55 @@ export class SessionManager {
 
       const brainResult = this.brain(finalTranscript.text, brainContext)
 
+      // Helper: flush a sentence to TTS and send audio to client
+      const flushSentence = async (text: string): Promise<void> => {
+        const trimmed = text.trim()
+        if (!trimmed) return
+        try {
+          for await (const chunk of this.audioRouter.synthesizeChunks(trimmed)) {
+            if (signal.aborted) return
+            this.transport.sendAudio(chunk.data)
+          }
+        } catch (err) {
+          this.logger.warn('session', `TTS error for sentence: ${(err as Error).message}`)
+        }
+      }
+
       if (isAsyncGenerator(brainResult)) {
         for await (const token of brainResult) {
           if (signal.aborted) break
           assistantText += token
-          this.sendEvent({
-            type: 'bot_text',
-            text: token,
-            messageId,
-          })
+          sentenceBuffer += token
+          this.sendEvent({ type: 'bot_text', text: token, messageId })
+
+          // Check for sentence boundaries — flush to TTS immediately
+          const sentenceEnd = sentenceBuffer.search(/[.!?]\s/)
+          if (sentenceEnd !== -1) {
+            const sentence = sentenceBuffer.slice(0, sentenceEnd + 2)
+            sentenceBuffer = sentenceBuffer.slice(sentenceEnd + 2)
+            await flushSentence(sentence)
+          }
         }
       } else {
         assistantText = await brainResult
-        this.sendEvent({
-          type: 'bot_text',
-          text: assistantText,
-          messageId,
-        })
+        this.sendEvent({ type: 'bot_text', text: assistantText, messageId })
+        sentenceBuffer = assistantText
+      }
+
+      // Flush any remaining text
+      if (!signal.aborted && sentenceBuffer.trim()) {
+        await flushSentence(sentenceBuffer)
       }
 
       // Signal text done
-      this.sendEvent({
-        type: 'bot_text_done',
-        messageId,
-        partial: signal.aborted,
-      })
+      this.sendEvent({ type: 'bot_text_done', messageId, partial: signal.aborted })
 
-      // 4. Add to history
+      // 5. Add to history
       this.history.addAssistantMessage(assistantText, {
         id: messageId,
         partial: signal.aborted,
       })
 
-      if (signal.aborted) {
-        this.turnManager.endTurn(true)
-        this.backToListening()
-        return
-      }
-
-      // 5. TTS: text → audio (via serial queue)
-      if (this.stateMachine.canTransition(SessionState.Speaking)) {
-        this.stateMachine.transition(SessionState.Speaking)
-        this.sendEvent({ type: 'state', state: this.stateMachine.state })
-      }
-
-      this.turnManager.enqueueTTS(async (gen) => {
-        if (!this.turnManager.isCurrentGeneration(gen)) return
-        if (signal.aborted) return
-        await this.audioRouter.synthesizeAndSend(assistantText)
-      })
-
-      await this.turnManager.waitForTTS()
       this.turnManager.endTurn(false)
       this.backToListening()
     } catch (error) {
