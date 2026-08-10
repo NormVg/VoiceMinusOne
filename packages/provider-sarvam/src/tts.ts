@@ -18,9 +18,10 @@ import type {
   AudioChunk,
   TTSConfig,
   TTSProvider,
+  TTSStream,
   PluginContext,
 } from '@voiceminusone/core'
-import { PluginError } from '@voiceminusone/core'
+import { BoundedChannel, PluginError } from '@voiceminusone/core'
 import {
   authHeaders,
   resolveApiKey,
@@ -101,6 +102,89 @@ export class SarvamTTS implements TTSProvider {
       controller.abort()
     }
     this.activeControllers.clear()
+  }
+
+  /**
+   * Open one WebSocket for a turn and feed it incrementally. This is the V2
+   * path used by the session runtime; `synthesize` remains the compatibility
+   * adapter for batch providers and existing applications.
+   */
+  async openStream(config: TTSConfig, signal: AbortSignal): Promise<TTSStream> {
+    const sampleRate = this.options.sampleRate ?? 22050
+    const speaker = config.speaker ?? this.options.speaker ?? 'shubh'
+    const language = config.language ?? this.options.language ?? 'en-IN'
+    const model = config.model ?? this.options.model ?? 'bulbul:v3'
+    const pace = config.pace ?? this.options.pace ?? 1
+    const url = `${this.baseUrl.replace('https', 'wss')}/text-to-speech/ws?${new URLSearchParams({ model })}`
+    const ws = await this.openWebSocket(url, this.apiKey)
+    if (!ws) throw new PluginError('TTS_FAILED', 'Failed to connect to Sarvam TTS WebSocket')
+
+    const audio = new BoundedChannel<AudioChunk>({ capacity: 64 })
+    let closed = false
+    const close = (): void => {
+      if (closed) return
+      closed = true
+      audio.close()
+      this.closeWebSocket(ws)
+    }
+
+    ws.onmessage = (event) => {
+      try {
+        const message = JSON.parse(String(event.data)) as Record<string, unknown>
+        if (message.type === 'complete' || message.type === 'finished') {
+          close()
+          return
+        }
+        if (message.type !== 'audio') return
+        const data = message.data as Record<string, unknown> | undefined
+        if (typeof data?.audio !== 'string') return
+        const pcm = stripWavHeader(base64ToArrayBuffer(data.audio))
+        if (pcm.byteLength > 0) {
+          void audio.write({ data: pcm, sampleRate, numChannels: 1 }).catch((error: unknown) => {
+            this.ctx?.logger.warn('sarvam-tts', `Live audio queue rejected a chunk: ${(error as Error).message}`)
+          })
+        }
+      } catch (error) {
+        this.ctx?.logger.warn('sarvam-tts', `Failed to parse live WS message: ${(error as Error).message}`)
+      }
+    }
+    ws.onerror = (error?: unknown) => {
+      audio.abort(new PluginError('TTS_FAILED', `Sarvam TTS WebSocket error: ${String(error ?? 'unknown error')}`))
+      close()
+    }
+    ws.onclose = close
+    signal.addEventListener('abort', close, { once: true })
+
+    ws.send(JSON.stringify({
+      type: 'config',
+      data: {
+        language_code: language,
+        speaker,
+        pitch: 0,
+        pace,
+        loudness: 1,
+        speech_sample_rate: sampleRate,
+        enable_preprocessing: false,
+        output_audio_codec: 'wav',
+        output_audio_bitrate: '128k',
+        min_buffer_size: 50,
+        max_chunk_length: 150,
+      },
+    } satisfies TTSWsMessage))
+
+    return {
+      audio,
+      async write(text: string): Promise<void> {
+        if (closed) throw new PluginError('TTS_FAILED', 'Cannot write to a closed Sarvam TTS stream')
+        const phrase = text.trim()
+        if (phrase) ws.send(JSON.stringify({ type: 'text', data: { text: phrase } } satisfies TTSWsMessage))
+      },
+      async flush(): Promise<void> {
+        if (!closed) ws.send(JSON.stringify({ type: 'flush' } satisfies TTSWsMessage))
+      },
+      async abort(): Promise<void> { close() },
+      async close(): Promise<void> { close() },
+    }
   }
 
   /**

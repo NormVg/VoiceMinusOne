@@ -17,18 +17,22 @@ import {
   type Logger,
   type Transport,
   type STTProvider,
+  type STTStream,
   type TTSProvider,
   type Brain,
   type AudioChunk,
   type TranscriptResult,
   type ConversationMessage,
+  type Clock,
   ConsoleLogger,
   LogLevel,
+  clock,
 } from '@voiceminusone/core'
 import { SessionStateMachine } from './state-machine'
 import { TurnManager } from './turn-manager'
 import { AudioRouter } from './audio-router'
 import { HistoryManager } from './history-manager'
+import { SentenceChunker } from './sentence-chunker'
 import {
   parseClientEvent,
   serializeServerEvent,
@@ -39,6 +43,7 @@ import {
 export interface SessionManagerOptions extends SessionConfig {
   readonly logger?: Logger
   readonly sessionId?: string
+  readonly clock?: Clock
 }
 
 export class SessionManager {
@@ -52,10 +57,17 @@ export class SessionManager {
   private stt: STTProvider
   private tts: TTSProvider
   private brain: Brain
+  private clock: Clock
   private destroyed = false
+  private liveSttStream: STTStream | null = null
+  private liveSttResults: TranscriptResult[] = []
+  private liveSttResultTask: Promise<void> | null = null
+  private liveSttAbort: AbortController | null = null
+  private inputAudioUnsub: (() => void) | null = null
 
   constructor(opts: SessionManagerOptions) {
-    this.sessionId = opts.sessionId ?? `session-${Date.now()}`
+    this.clock = opts.clock ?? clock
+    this.sessionId = opts.sessionId ?? `session-${this.clock.now()}`
     this.logger = opts.logger ?? new ConsoleLogger(LogLevel.Info)
     this.transport = opts.transport
     this.stt = opts.stt
@@ -94,7 +106,7 @@ export class SessionManager {
     const ctx = {
       logger: this.logger.child('plugin'),
       events: { on: () => () => {}, once: () => () => {}, emit: () => {}, off: () => {}, clear: () => {} },
-      clock: { now: () => Date.now() },
+      clock: this.clock,
       signal: new AbortController().signal,
     }
     await this.stt.init?.(ctx)
@@ -107,6 +119,7 @@ export class SessionManager {
 
     // Start listening for audio
     await this.audioRouter.startListening()
+    this.inputAudioUnsub = this.audioRouter.onInputAudio((chunk) => this.writeLiveStt(chunk))
     this.stateMachine.transition(SessionState.Listening)
 
     this.sendEvent({ type: 'state', state: this.stateMachine.state })
@@ -119,6 +132,9 @@ export class SessionManager {
     this.logger.info('session', `Stopping session ${this.sessionId}`)
 
     this.turnManager.interruptTurn()
+    await this.closeLiveStt()
+    this.inputAudioUnsub?.()
+    this.inputAudioUnsub = null
     this.audioRouter.abort()
     await this.audioRouter.destroy()
 
@@ -194,6 +210,13 @@ export class SessionManager {
       this.sendEvent({ type: 'audio_flush' })
     }
 
+    await this.openLiveStt()
+
+    // Barge-in can arrive while the state machine is Speaking. Move through
+    // Listening explicitly; it is the only legal bridge into Receiving.
+    if (this.stateMachine.state === SessionState.Speaking && this.stateMachine.canTransition(SessionState.Listening)) {
+      this.stateMachine.transition(SessionState.Listening)
+    }
     if (this.stateMachine.canTransition(SessionState.Receiving)) {
       this.stateMachine.transition(SessionState.Receiving)
       this.sendEvent({ type: 'state', state: this.stateMachine.state })
@@ -204,7 +227,18 @@ export class SessionManager {
   private async handleStopSpeaking(): Promise<void> {
     this.logger.debug('session', 'User stopped speaking')
 
-    // Drain buffered audio from the AudioRouter
+    if (this.liveSttStream) {
+      await this.liveSttStream.flush()
+      await this.waitForLiveSttResult()
+      const finalTranscript = this.liveSttResults.find((result) => result.isFinal)
+      await this.closeLiveStt()
+      if (finalTranscript?.text.trim()) {
+        await this.runTurn([], finalTranscript)
+        return
+      }
+    }
+
+    // Fallback for batch-only STT providers.
     const audioChunks = this.audioRouter.drainAudio()
     if (audioChunks.length === 0) {
       this.logger.warn('session', 'No audio chunks received')
@@ -229,31 +263,32 @@ export class SessionManager {
    *  chunks and sent to TTS immediately — TTS starts generating audio
    *  while the LLM is still producing text. This minimizes time-to-first-audio.
    */
-  private async runTurn(audioChunks: AudioChunk[]): Promise<void> {
+  private async runTurn(
+    audioChunks: AudioChunk[],
+    streamedTranscript?: TranscriptResult,
+  ): Promise<void> {
     const { turnId, signal } = this.turnManager.startTurn()
-    const T0 = Date.now()
+    const T0 = this.clock.now()
     const timings: Record<string, number> = {}
     const mark = (label: string): void => {
-      timings[label] = Date.now() - T0
+      timings[label] = this.clock.now() - T0
     }
 
     try {
       // 1. STT: audio → transcript
       mark('start')
-      const audioStream = this.chunksToAsyncIterable(audioChunks)
-      const transcripts: TranscriptResult[] = []
-
-      for await (const result of this.audioRouter.transcribe(audioStream)) {
-        transcripts.push(result)
-        this.sendEvent({
-          type: 'transcript',
-          text: result.text,
-          isFinal: result.isFinal,
-        })
+      let finalTranscript = streamedTranscript
+      if (!finalTranscript) {
+        const audioStream = this.chunksToAsyncIterable(audioChunks)
+        const transcripts: TranscriptResult[] = []
+        for await (const result of this.audioRouter.transcribe(audioStream)) {
+          transcripts.push(result)
+          this.sendEvent({ type: 'transcript', text: result.text, isFinal: result.isFinal })
+        }
+        finalTranscript = transcripts.find((result) => result.isFinal)
       }
       mark('stt_done')
 
-      const finalTranscript = transcripts.find((t) => t.isFinal)
       if (!finalTranscript || !finalTranscript.text.trim()) {
         this.logger.warn('session', 'No final transcript, skipping turn')
         this.turnManager.endTurn(false)
@@ -277,9 +312,21 @@ export class SessionManager {
       // is still generating, minimizing time-to-first-audio.
       const messageId = `bot-${turnId}`
       let assistantText = ''
-      let sentenceBuffer = ''
       let firstAudioSent = false
       let sentenceCount = 0
+      const sentenceChunker = new SentenceChunker()
+      const ttsStream = this.tts.openStream
+        ? await this.tts.openStream({}, signal)
+        : null
+      const streamAudioTask = ttsStream
+        ? this.forwardTtsStream(ttsStream, signal, () => {
+            if (!firstAudioSent) {
+              firstAudioSent = true
+              mark('first_audio')
+              this.logger.info('session', `⏱️ FIRST AUDIO at ${timings.first_audio}ms (stream)`)
+            }
+          })
+        : null
 
       const brainContext = {
         sessionId: this.sessionId,
@@ -290,54 +337,70 @@ export class SessionManager {
       const brainResult = this.brain(finalTranscript.text, brainContext)
       mark('brain_start')
 
-      // Helper: flush a sentence to TTS and send audio to client
-      const flushSentence = async (text: string): Promise<void> => {
+      // Queue a phrase without blocking Brain token consumption. The
+      // TurnManager serializes audio to preserve order while allowing the
+      // model to continue producing text concurrently.
+      const queueSentence = (text: string): void => {
         const trimmed = text.trim()
-        if (!trimmed) return
+        if (!trimmed || signal.aborted) return
         sentenceCount++
         if (!timings.tts_start) {
           mark('tts_start')
         }
-        try {
-          for await (const chunk of this.audioRouter.synthesizeChunks(trimmed)) {
-            if (signal.aborted) return
-            this.transport.sendAudio(chunk.data)
-            if (!firstAudioSent) {
-              firstAudioSent = true
-              mark('first_audio')
-              this.logger.info('session', `⏱️ FIRST AUDIO at ${timings.first_audio}ms (sentence ${sentenceCount})`)
+        this.turnManager.enqueueTTS(async () => {
+          try {
+            if (ttsStream) {
+              await ttsStream.write(trimmed)
+              return
             }
+            for await (const chunk of this.audioRouter.synthesizeChunks(trimmed)) {
+              if (signal.aborted) return
+              this.transport.sendAudio(chunk.data)
+              if (!firstAudioSent) {
+                firstAudioSent = true
+                mark('first_audio')
+                this.logger.info('session', `⏱️ FIRST AUDIO at ${timings.first_audio}ms (phrase ${sentenceCount})`)
+              }
+            }
+          } catch (err) {
+            this.logger.warn('session', `TTS error for phrase: ${(err as Error).message}`)
           }
-        } catch (err) {
-          this.logger.warn('session', `TTS error for sentence: ${(err as Error).message}`)
-        }
+        })
       }
 
       if (isAsyncGenerator(brainResult)) {
         for await (const token of brainResult) {
           if (signal.aborted) break
           assistantText += token
-          sentenceBuffer += token
           this.sendEvent({ type: 'bot_text', text: token, messageId })
 
-          // Check for sentence boundaries — flush to TTS immediately
-          const sentenceEnd = sentenceBuffer.search(/[.!?]\s/)
-          if (sentenceEnd !== -1) {
-            const sentence = sentenceBuffer.slice(0, sentenceEnd + 2)
-            sentenceBuffer = sentenceBuffer.slice(sentenceEnd + 2)
-            await flushSentence(sentence)
+          // Emit phrase-sized chunks as soon as they are ready. This must not
+          // await TTS: doing so recreates the old LLM → TTS waterfall.
+          for (const phrase of sentenceChunker.process(token)) {
+            queueSentence(phrase)
           }
         }
       } else {
         assistantText = await brainResult
         this.sendEvent({ type: 'bot_text', text: assistantText, messageId })
-        sentenceBuffer = assistantText
+        for (const phrase of sentenceChunker.process(assistantText)) {
+          queueSentence(phrase)
+        }
       }
       mark('brain_done')
 
-      // Flush any remaining text
-      if (!signal.aborted && sentenceBuffer.trim()) {
-        await flushSentence(sentenceBuffer)
+      // Flush any remaining phrase, then wait for ordered audio after Brain
+      // generation has completed.
+      if (!signal.aborted) {
+        for (const phrase of sentenceChunker.flush()) {
+          queueSentence(phrase)
+        }
+      }
+      await this.turnManager.waitForTTS()
+      if (ttsStream) {
+        await ttsStream.flush()
+        await streamAudioTask
+        await ttsStream.close()
       }
       mark('tts_done')
 
@@ -351,7 +414,7 @@ export class SessionManager {
       })
 
       // Print timing stats
-      const total = Date.now() - T0
+      const total = this.clock.now() - T0
       const sttMs = (timings.stt_done ?? 0) - (timings.start ?? 0)
       const brainMs = (timings.brain_done ?? 0) - (timings.brain_start ?? 0)
       const firstAudioMs = timings.first_audio ?? 0
@@ -399,6 +462,9 @@ export class SessionManager {
 
   /** Transition back to listening state. */
   private backToListening(): void {
+    // A new user turn may have started while an invalidated async task was
+    // unwinding. Never let that stale task overwrite Receiving.
+    if (this.stateMachine.state === SessionState.Receiving) return
     if (this.stateMachine.canTransition(SessionState.Listening)) {
       this.stateMachine.transition(SessionState.Listening)
       this.sendEvent({ type: 'state', state: this.stateMachine.state })
@@ -420,6 +486,86 @@ export class SessionManager {
   private sendEvent(event: ServerToClientEvent): void {
     const serialized = serializeServerEvent(event)
     this.transport.sendEvent(serialized)
+  }
+
+  private async openLiveStt(): Promise<void> {
+    if (!this.stt.openStream) return
+    await this.closeLiveStt()
+    const controller = new AbortController()
+    this.liveSttAbort = controller
+    try {
+      const stream = await this.stt.openStream({}, controller.signal)
+      this.liveSttStream = stream
+      this.liveSttResults = []
+      this.liveSttResultTask = (async () => {
+        for await (const result of stream.results) {
+          this.liveSttResults.push(result)
+          this.sendEvent({ type: 'transcript', text: result.text, isFinal: result.isFinal })
+          if (result.isFinal) return
+        }
+      })()
+    } catch (error) {
+      this.logger.warn('session', `Live STT unavailable, using batch fallback: ${(error as Error).message}`)
+      this.liveSttAbort = null
+    }
+  }
+
+  private async writeLiveStt(chunk: AudioChunk): Promise<void> {
+    if (!this.liveSttStream || this.liveSttAbort?.signal.aborted) return
+    await this.liveSttStream.write(chunk)
+  }
+
+  private async closeLiveStt(): Promise<void> {
+    const controller = this.liveSttAbort
+    controller?.abort()
+    this.liveSttAbort = null
+    const stream = this.liveSttStream
+    this.liveSttStream = null
+    if (stream) {
+      try {
+        await stream.abort()
+      } catch (error) {
+        this.logger.debug('session', `Live STT abort failed: ${(error as Error).message}`)
+      }
+      await stream.close()
+    }
+    this.liveSttResultTask = null
+    this.liveSttResults = []
+  }
+
+  private async forwardTtsStream(
+    stream: import('@voiceminusone/core').TTSStream,
+    signal: AbortSignal,
+    onFirstAudio: () => void,
+  ): Promise<void> {
+    try {
+      for await (const chunk of stream.audio) {
+        if (signal.aborted) return
+        onFirstAudio()
+        this.transport.sendAudio(chunk.data)
+      }
+    } catch (error) {
+      if (!signal.aborted) {
+        this.logger.warn('session', `Live TTS stream failed: ${(error as Error).message}`)
+      }
+    }
+  }
+
+  /** Wait briefly for a provider final result without letting a bad socket hang a turn. */
+  private async waitForLiveSttResult(): Promise<void> {
+    const task = this.liveSttResultTask
+    if (!task) return
+    let timeout: ReturnType<typeof setTimeout> | null = null
+    try {
+      await Promise.race([
+        task,
+        new Promise<void>((resolve) => {
+          timeout = setTimeout(resolve, 1500)
+        }),
+      ])
+    } finally {
+      if (timeout) clearTimeout(timeout)
+    }
   }
 }
 

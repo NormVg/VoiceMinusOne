@@ -1,9 +1,20 @@
 # VoiceMinusOne — Project Document
 
 > **Last updated**: 2026-08-09
-> **Status**: Planning → Architecture phase
+> **Status**: Real-time runtime migration in progress
 > **Stack**: TypeScript, Node.js, pnpm monorepo, Nuxt v4, crossws, Ably, AI SDK 7, Sarvam AI
 > **No Python.** Pure TypeScript/Node.js end to end.
+
+> **Active execution plan**: [`plan.md`](./plan.md). The current runtime is
+> being rebuilt around bounded streaming sessions, beginning with the live
+> LLM-to-TTS orchestration path.
+
+## Real-time migration status
+
+- [x] Streaming provider contracts, bounded runtime primitives, and turn-scoped cancellation.
+- [x] Server live-STT frame routing with batch-provider fallback.
+- [x] Concurrent Brain-to-TTS phrase scheduling and browser playback cancellation.
+- [ ] Persistent provider connections, AudioWorklet capture, protocol V2, and full trace-based E2E verification.
 
 ---
 

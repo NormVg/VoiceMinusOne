@@ -79,6 +79,9 @@ export class Mic {
   private config: MicConfig
   private micVAD: MicVADLike | null = null
   private mediaStream: MediaStream | null = null
+  private audioContext: AudioContext | null = null
+  private worklet: AudioWorkletNode | null = null
+  private pcmRemainder = new Float32Array(0)
 
   private started = false
   private muted = false
@@ -105,6 +108,8 @@ export class Mic {
       },
     })
 
+    await this.startFrameCapture(this.mediaStream)
+
     // Dynamically import @ricky0123/vad-web (browser-only)
     const vadModule = (await import('@ricky0123/vad-web')) as unknown as {
       MicVAD: { new: (opts: Partial<MicVADOptions>) => Promise<MicVADLike> }
@@ -128,9 +133,10 @@ export class Mic {
       },
       onSpeechEnd: (audio: Float32Array) => {
         this.speaking = false
-        // Convert Float32 samples to 16-bit PCM ArrayBuffer
-        const pcm = this.float32ToInt16(audio)
-        this.emitChunk(pcm.buffer as ArrayBuffer)
+        // PCM has already been sent in 20ms frames by the AudioWorklet.
+        // Keeping this callback only for VAD endpoint/state notification avoids
+        // the old full-utterance upload duplicate.
+        void audio
         this.notifyState()
       },
       onVADMisfire: () => {
@@ -157,6 +163,14 @@ export class Mic {
       }
       this.mediaStream = null
     }
+
+    this.worklet?.disconnect()
+    this.worklet = null
+    if (this.audioContext) {
+      void this.audioContext.close()
+      this.audioContext = null
+    }
+    this.pcmRemainder = new Float32Array(0)
 
     this.started = false
     this.speaking = false
@@ -209,6 +223,53 @@ export class Mic {
       pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff
     }
     return pcm
+  }
+
+  /** Capture tiny PCM frames independently from VAD's utterance callback. */
+  private async startFrameCapture(stream: MediaStream): Promise<void> {
+    const context = new AudioContext({ sampleRate: this.config.sampleRate })
+    const moduleSource = `class VoiceMinusOnePcmProcessor extends AudioWorkletProcessor {
+      process(inputs) {
+        const input = inputs[0] && inputs[0][0]
+        if (input) this.port.postMessage(input.slice().buffer, [input.slice().buffer])
+        return true
+      }
+    }
+    registerProcessor('voiceminusone-pcm', VoiceMinusOnePcmProcessor)`
+    const url = URL.createObjectURL(new Blob([moduleSource], { type: 'text/javascript' }))
+    try {
+      await context.audioWorklet.addModule(url)
+    } finally {
+      URL.revokeObjectURL(url)
+    }
+    const source = context.createMediaStreamSource(stream)
+    const worklet = new AudioWorkletNode(context, 'voiceminusone-pcm')
+    worklet.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+      if (this.speaking && !this.muted) this.appendFrame(new Float32Array(event.data))
+    }
+    source.connect(worklet)
+    // Worklets are only scheduled when part of a live graph. Keep it alive
+    // through a zero-gain output so captured mic samples are never audible.
+    const silentOutput = context.createGain()
+    silentOutput.gain.value = 0
+    worklet.connect(silentOutput)
+    silentOutput.connect(context.destination)
+    this.audioContext = context
+    this.worklet = worklet
+  }
+
+  private appendFrame(samples: Float32Array): void {
+    const merged = new Float32Array(this.pcmRemainder.length + samples.length)
+    merged.set(this.pcmRemainder)
+    merged.set(samples, this.pcmRemainder.length)
+    const frameSamples = Math.round(this.config.sampleRate * 0.02)
+    let offset = 0
+    while (offset + frameSamples <= merged.length) {
+      const pcm = this.float32ToInt16(merged.subarray(offset, offset + frameSamples))
+      this.emitChunk(pcm.buffer as ArrayBuffer)
+      offset += frameSamples
+    }
+    this.pcmRemainder = merged.slice(offset)
   }
 
   /** Emit a chunk to all listeners. */

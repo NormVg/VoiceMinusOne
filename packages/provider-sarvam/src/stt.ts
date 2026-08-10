@@ -9,10 +9,11 @@ import type {
   AudioChunk,
   STTConfig,
   STTProvider,
+  STTStream,
   TranscriptResult,
   PluginContext,
 } from '@voiceminusone/core'
-import { PluginError } from '@voiceminusone/core'
+import { BoundedChannel, PluginError } from '@voiceminusone/core'
 import {
   authHeaders,
   concatBuffers,
@@ -71,6 +72,57 @@ export class SarvamSTT implements STTProvider {
     this.abortController?.abort()
   }
 
+  /** Open a frame-fed Saaras WebSocket for one speech turn. */
+  async openStream(config: STTConfig, signal: AbortSignal): Promise<STTStream> {
+    const model = config.model ?? this.options.model ?? 'saaras:v3'
+    const params = new URLSearchParams({ model, sample_rate: String(this.options.sampleRate ?? 16000), flush_signal: 'true' })
+    const language = config.language ?? this.options.language
+    if (language) params.set('language_code', language)
+    const ws = await this.openWebSocket(`${this.baseUrl.replace('https', 'wss')}/speech-to-text/ws?${params}`, this.apiKey)
+    if (!ws) throw new PluginError('STT_FAILED', 'Failed to connect to Sarvam STT WebSocket')
+
+    const results = new BoundedChannel<TranscriptResult>({ capacity: 32 })
+    let closed = false
+    const close = (): void => {
+      if (closed) return
+      closed = true
+      results.close()
+      this.closeWebSocket(ws)
+    }
+    ws.onmessage = (event) => {
+      try {
+        const result = this.parseWsMessage(JSON.parse(String(event.data)) as Record<string, unknown>)
+        if (result) {
+          void results.write(result).catch((error: unknown) => {
+            this.ctx?.logger.warn('sarvam-stt', `Live transcript queue rejected a result: ${(error as Error).message}`)
+          })
+        }
+      } catch (error) {
+        this.ctx?.logger.warn('sarvam-stt', `Failed to parse live WS message: ${(error as Error).message}`)
+      }
+    }
+    ws.onerror = (error?: unknown) => {
+      results.abort(new PluginError('STT_FAILED', `Sarvam STT WebSocket error: ${String(error ?? 'unknown error')}`))
+      close()
+    }
+    ws.onclose = close
+    signal.addEventListener('abort', close, { once: true })
+
+    return {
+      results,
+      async write(chunk: AudioChunk): Promise<void> {
+        if (closed) throw new PluginError('STT_FAILED', 'Cannot write to a closed Sarvam STT stream')
+        // Sarvam requires provider-local base64; application transport remains binary.
+        ws.send(JSON.stringify({ audio: { data: arrayBufferToBase64(chunk.data), sample_rate: chunk.sampleRate, encoding: 'audio/wav' } }))
+      },
+      async flush(): Promise<void> {
+        if (!closed) ws.send(JSON.stringify({ type: 'flush' }))
+      },
+      async abort(): Promise<void> { close() },
+      async close(): Promise<void> { close() },
+    }
+  }
+
   /**
    * Transcribe an audio stream. Buffers chunks, sends to Sarvam.
    * Tries WebSocket streaming first, falls back to REST.
@@ -106,12 +158,15 @@ export class SarvamSTT implements STTProvider {
     // Use the shared createSarvamWebSocket helper which handles both
     // Node.js (ws package with header auth) and browser (query param auth).
     // It already awaits the connection open before returning.
+    this.ctx?.logger?.info('sarvam-stt', `Opening WS: ${url.replace(/api_key=[^&]+/, 'api_key=***')}`)
     const ws = await this.openWebSocket(url, this.apiKey)
     if (!ws) {
+      this.ctx?.logger?.warn('sarvam-stt', 'WS open failed, falling back to REST')
       // Fallback to REST
       yield* this.transcribeRest(audio, config)
       return
     }
+    this.ctx?.logger?.info('sarvam-stt', `WS opened, readyState=${ws.readyState}`)
 
     const abortController = new AbortController()
     this.abortController = abortController
@@ -126,25 +181,27 @@ export class SarvamSTT implements STTProvider {
 
     /** Reset the idle timer. After flush, if no message arrives within
      *  the timeout, we consider transcription complete and close the socket.
-     *  Kept short (500ms) because Sarvam sends all transcripts quickly
-     *  after flush — the 3s timeout was adding unnecessary latency.
-     *  Reduced to 200ms as a safety net; we close immediately on
-     *  receiving a final transcript. */
+     *  3s safety net — Sarvam typically responds within 1-2s of flush.
+     *  We close immediately on receiving a final transcript, so this only
+     *  fires if Sarvam fails to respond. */
     const resetIdleTimer = (): void => {
       if (idleTimer) clearTimeout(idleTimer)
       if (flushSent) {
         idleTimer = setTimeout(() => {
           wsClosed = true
           resolveMessage?.()
-        }, 200)
+        }, 3000)
       }
     }
 
     ws.onmessage = (event) => {
       try {
-        const msg = JSON.parse(String(event.data)) as Record<string, unknown>
+        const raw = String(event.data)
+        this.ctx?.logger?.debug('sarvam-stt', `WS message: ${raw.substring(0, 200)}`)
+        const msg = JSON.parse(raw) as Record<string, unknown>
         const result = this.parseWsMessage(msg)
         if (result) {
+          this.ctx?.logger?.info('sarvam-stt', `Parsed transcript: isFinal=${result.isFinal} text="${result.text.substring(0, 60)}"`)
           messageQueue.push(result)
           resolveMessage?.()
           // If we got a final transcript after flush, close immediately
@@ -163,13 +220,15 @@ export class SarvamSTT implements STTProvider {
 
     ws.onerror = (err?: unknown) => {
       const errMsg = err ? String(err) : 'unknown error'
+      this.ctx?.logger?.error('sarvam-stt', `WS error: ${errMsg}`)
       wsError = new PluginError('STT_FAILED', `Sarvam STT WebSocket error: ${errMsg}`)
       wsClosed = true
       if (idleTimer) clearTimeout(idleTimer)
       resolveMessage?.()
     }
 
-    ws.onclose = () => {
+    ws.onclose = (ev?: { code?: number; reason?: string }) => {
+      this.ctx?.logger?.info('sarvam-stt', `WS closed: code=${ev?.code} reason=${ev?.reason ?? ''}`)
       wsClosed = true
       if (idleTimer) clearTimeout(idleTimer)
       resolveMessage?.()
@@ -193,7 +252,13 @@ export class SarvamSTT implements STTProvider {
       const wav = pcm16ToWav(pcm, sampleRate)
       const b64 = arrayBufferToBase64(wav)
 
-      if (ws.readyState !== 1) return
+      this.ctx?.logger?.info('sarvam-stt', `Sending ${chunks.length} chunks, ${pcm.byteLength} bytes PCM, ${wav.byteLength} bytes WAV, sampleRate=${sampleRate}`)
+
+      if (ws.readyState !== 1) {
+        this.ctx?.logger?.warn('sarvam-stt', `WS not open when trying to send (readyState=${ws.readyState})`)
+        return
+      }
+      this.ctx?.logger?.info('sarvam-stt', `Sending audio + flush`)
       ws.send(JSON.stringify({
         audio: {
           data: b64,

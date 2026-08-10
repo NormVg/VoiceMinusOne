@@ -52,12 +52,23 @@ export interface TranscriptResult {
   readonly timestamp?: number
 }
 
+/** A live STT connection owned by one voice session. */
+export interface STTStream {
+  readonly results: AsyncIterable<TranscriptResult>
+  write(chunk: AudioChunk): Promise<void>
+  flush(): Promise<void>
+  abort(): Promise<void>
+  close(): Promise<void>
+}
+
 export interface STTProvider extends PluginLifecycle {
   transcribe(
     audio: AsyncIterable<AudioChunk>,
     config: STTConfig,
   ): AsyncIterable<TranscriptResult>
   abort?(): void
+  /** Optional V2 streaming API. Providers without it use the batch adapter. */
+  openStream?(config: STTConfig, signal: AbortSignal): Promise<STTStream>
 }
 
 // --- TTS ---
@@ -69,9 +80,20 @@ export interface TTSConfig {
   pace?: number
 }
 
+/** A live TTS connection that accepts incremental text for one turn. */
+export interface TTSStream {
+  readonly audio: AsyncIterable<AudioChunk>
+  write(text: string): Promise<void>
+  flush(): Promise<void>
+  abort(): Promise<void>
+  close(): Promise<void>
+}
+
 export interface TTSProvider extends PluginLifecycle {
   synthesize(text: string, config: TTSConfig): AsyncIterable<AudioChunk>
   abort?(): void
+  /** Optional V2 streaming API. Providers without it use phrase batching. */
+  openStream?(config: TTSConfig, signal: AbortSignal): Promise<TTSStream>
 }
 
 // --- LLM (Brain) ---

@@ -20,8 +20,8 @@ export interface SpeakerConfig {
 export const DEFAULT_SPEAKER_CONFIG: SpeakerConfig = {
   sampleRate: 22050,
   numChannels: 1,
-  prebufferDurationMs: 100,
-  quietFlushDelayMs: 600,
+  prebufferDurationMs: 50,
+  quietFlushDelayMs: 150,
 }
 
 export type SpeakerStateListener = (state: SpeakerState) => void
@@ -39,7 +39,9 @@ export class Speaker {
   private prebuffering = false
   private nextStartTime = 0
   private quietTimer: ReturnType<typeof setTimeout> | null = null
+  private scheduledSources = new Set<AudioBufferSourceNode>()
   private playing = false
+  private error: string | undefined
   private stateListeners: SpeakerStateListener[] = []
 
   constructor(config: Partial<SpeakerConfig> = {}) {
@@ -48,6 +50,7 @@ export class Speaker {
 
   /** Initialize the speaker (must be called from a user gesture). */
   async init(): Promise<void> {
+    if (this.audioContext) return
     const AudioContextClass =
       globalThis.AudioContext ?? (globalThis as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
     this.audioContext = new AudioContextClass()
@@ -109,6 +112,7 @@ export class Speaker {
     const source = this.audioContext.createBufferSource()
     source.buffer = audioBuffer
     source.connect(this.audioContext.destination)
+    this.scheduledSources.add(source)
 
     const now = this.audioContext.currentTime
     const startTime = Math.max(this.nextStartTime, now)
@@ -117,8 +121,9 @@ export class Speaker {
     this.nextStartTime = startTime + audioBuffer.duration
 
     source.onended = () => {
+      this.scheduledSources.delete(source)
       // Check if playback has ended
-      if (this.nextStartTime <= this.audioContext!.currentTime + 0.01) {
+      if (this.scheduledSources.size === 0 && this.nextStartTime <= this.audioContext!.currentTime + 0.01) {
         this.playing = false
         this.notifyState()
       }
@@ -154,6 +159,15 @@ export class Speaker {
       this.quietTimer = null
     }
     this.prebuffer = []
+    for (const source of this.scheduledSources) {
+      try {
+        source.stop()
+        source.disconnect()
+      } catch (error) {
+        this.error = `Failed to stop audio source: ${(error as Error).message}`
+      }
+    }
+    this.scheduledSources.clear()
     this.prebufferDuration = 0
     this.prebuffering = true
     this.playing = false
@@ -173,7 +187,10 @@ export class Speaker {
 
   /** Get the current state. */
   getState(): SpeakerState {
-    return { playing: this.playing }
+    return {
+      playing: this.playing,
+      ...(this.error !== undefined ? { error: this.error } : {}),
+    }
   }
 
   /** Subscribe to state changes. */

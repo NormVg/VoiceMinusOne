@@ -21,6 +21,7 @@ import type {
   Logger,
 } from '@voiceminusone/core'
 import { SilentLogger } from '@voiceminusone/core'
+import { decodeAudioEnvelope } from '@voiceminusone/core'
 
 export interface AudioRouterOptions {
   readonly transport: Transport
@@ -33,6 +34,7 @@ export interface AudioRouterOptions {
 
 export type TranscriptHandler = (result: TranscriptResult) => void
 export type TTSChunkHandler = (chunk: ArrayBuffer) => void
+export type InputAudioHandler = (chunk: AudioChunk) => void | Promise<void>
 
 export class AudioRouter {
   private logger: Logger = new SilentLogger()
@@ -41,9 +43,12 @@ export class AudioRouter {
   /** Active STT audio queue — chunks are pushed here, STT drains them. */
   private sttChunkQueue: AudioChunk[] = []
   private sttActive = false
+  private inputEpoch = -1
+  private inputSequence = -1
 
   private transcriptHandlers: TranscriptHandler[] = []
   private ttsChunkHandlers: TTSChunkHandler[] = []
+  private inputAudioHandlers: InputAudioHandler[] = []
 
   private transportAudioUnsub: (() => void) | null = null
 
@@ -151,6 +156,15 @@ export class AudioRouter {
     }
   }
 
+  /** Observe each incoming PCM frame for live STT streaming. */
+  onInputAudio(handler: InputAudioHandler): () => void {
+    this.inputAudioHandlers.push(handler)
+    return () => {
+      const idx = this.inputAudioHandlers.indexOf(handler)
+      if (idx >= 0) this.inputAudioHandlers.splice(idx, 1)
+    }
+  }
+
   /** Abort any in-flight STT/TTS operations. */
   abort(): void {
     this.opts.stt.abort?.()
@@ -169,12 +183,29 @@ export class AudioRouter {
   private handleIncomingAudio(chunk: ArrayBuffer): void {
     if (!this.sttActive) return
 
+    const envelope = decodeAudioEnvelope(chunk)
+    if (envelope) {
+      if (envelope.epoch < this.inputEpoch ||
+        (envelope.epoch === this.inputEpoch && envelope.sequence <= this.inputSequence)) {
+        this.logger.debug('audio-router', `Dropped stale audio frame ${envelope.epoch}:${envelope.sequence}`)
+        return
+      }
+      this.inputEpoch = envelope.epoch
+      this.inputSequence = envelope.sequence
+      chunk = envelope.payload
+    }
+
     const audioChunk: AudioChunk = {
       data: chunk,
       sampleRate: this.opts.sampleRate ?? 16000,
       numChannels: 1,
     }
     this.sttChunkQueue.push(audioChunk)
+    for (const handler of this.inputAudioHandlers) {
+      Promise.resolve(handler(audioChunk)).catch((error: unknown) => {
+        this.logger.error('audio-router', `Input audio handler error: ${(error as Error).message}`)
+      })
+    }
   }
 
   private notifyTranscript(result: TranscriptResult): void {

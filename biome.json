@@ -37,9 +37,6 @@
       "suspicious": {
         "noExplicitAny": "error"
       },
-      "style": {
-        "noConsole": "error"
-      },
       "correctness": {
         "noUnusedVariables": "warn"
       }

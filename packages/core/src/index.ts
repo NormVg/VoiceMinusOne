@@ -58,8 +58,10 @@ export type {
   AudioChunk,
   STTConfig,
   TranscriptResult,
+  STTStream,
   STTProvider,
   TTSConfig,
+  TTSStream,
   TTSProvider,
   BrainContext,
   ConversationMessage,
@@ -96,3 +98,19 @@ export { LogLevel, ConsoleLogger, SilentLogger, logger } from './utils/logger'
 export type { Logger } from './utils/logger'
 export { TypedEventBus } from './utils/event-bus'
 export type { EventBus, EventHandler } from './utils/event-bus'
+
+// Runtime primitives
+export {
+  BoundedChannel,
+  TurnScopeController,
+  LatencyTrace,
+  encodeAudioEnvelope,
+  decodeAudioEnvelope,
+} from './runtime'
+export type {
+  BoundedChannelOptions,
+  TurnScope,
+  LatencyMark,
+  LatencyTraceSnapshot,
+  AudioEnvelope,
+} from './runtime'

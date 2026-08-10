@@ -14,6 +14,7 @@
 
 import { Mic } from '../audio/mic'
 import { Speaker } from '../audio/speaker'
+import { encodeAudioEnvelope } from '@voiceminusone/core'
 
 export interface ClientConfig {
   readonly url: string
@@ -92,6 +93,8 @@ export class VoiceMinusOneClient {
   private turnStartTime: number | null = null
   /** Client-measured E2E latency (stop_speaking → first audio chunk). */
   private e2eLatencyMs: number | null = null
+  private inputEpoch = 0
+  private inputSequence = 0
 
   private micChunkUnsub: (() => void) | null = null
   private micStateUnsub: (() => void) | null = null
@@ -182,18 +185,10 @@ export class VoiceMinusOneClient {
     await this.mic.start()
     await this.speaker.init()
 
-    // Send audio chunks to server — chunks arrive as complete speech
-    // utterances (Silero VAD emits on speech end)
+    // Send AudioWorklet PCM frames immediately while VAD is active.
     this.micChunkUnsub = this.mic.onChunk((chunk) => {
       if (this.connected && !this.muted) {
-        this.ws?.send(chunk) // Binary frame — never base64 (R-010)
-        // After the audio is sent, signal stop_speaking so the server
-        // runs the STT → Brain → TTS pipeline on this utterance
-        this.speaking = false
-        this.turnStartTime = Date.now()
-        this.e2eLatencyMs = null
-        this.sendEvent({ type: 'stop_speaking' })
-        this.notifyState()
+        this.ws?.send(encodeAudioEnvelope(this.inputEpoch, this.inputSequence++, chunk))
       }
     })
 
@@ -201,7 +196,15 @@ export class VoiceMinusOneClient {
     this.micStateUnsub = this.mic.onStateChange((state) => {
       if (state.speaking && !this.speaking) {
         this.speaking = true
+        this.inputEpoch += 1
+        this.inputSequence = 0
         this.sendEvent({ type: 'start_speaking' })
+        this.notifyState()
+      } else if (!state.speaking && this.speaking) {
+        this.speaking = false
+        this.turnStartTime = Date.now()
+        this.e2eLatencyMs = null
+        this.sendEvent({ type: 'stop_speaking' })
         this.notifyState()
       }
     })
