@@ -234,9 +234,9 @@ export class SarvamSTT implements STTProvider {
       resolveMessage?.()
     }
 
-    // Buffer audio chunks, wrap as WAV, and send as a single message.
-    // The Sarvam API expects WAV-wrapped audio (encoding: "audio/wav"),
-    // not individual raw PCM chunks.
+    // Buffer audio chunks, wrap as WAV, and send in chunks to avoid
+    // exceeding WebSocket message size limits. Sarvam accepts multiple
+    // audio messages before flush.
     const sendPromise = (async () => {
       const chunks: ArrayBuffer[] = []
       let sampleRate = 16000
@@ -247,25 +247,34 @@ export class SarvamSTT implements STTProvider {
       }
       if (signal.aborted || chunks.length === 0) return
 
-      // Concatenate PCM and wrap as WAV
+      // Concatenate all PCM
       const pcm = concatBuffers(chunks)
-      const wav = pcm16ToWav(pcm, sampleRate)
-      const b64 = arrayBufferToBase64(wav)
-
-      this.ctx?.logger?.info('sarvam-stt', `Sending ${chunks.length} chunks, ${pcm.byteLength} bytes PCM, ${wav.byteLength} bytes WAV, sampleRate=${sampleRate}`)
+      this.ctx?.logger?.info('sarvam-stt', `Sending ${chunks.length} chunks, ${pcm.byteLength} bytes PCM, sampleRate=${sampleRate}`)
 
       if (ws.readyState !== 1) {
         this.ctx?.logger?.warn('sarvam-stt', `WS not open when trying to send (readyState=${ws.readyState})`)
         return
       }
-      this.ctx?.logger?.info('sarvam-stt', `Sending audio + flush`)
-      ws.send(JSON.stringify({
-        audio: {
-          data: b64,
-          sample_rate: sampleRate,
-          encoding: 'audio/wav',
-        },
-      }))
+
+      // Send in ~100KB chunks (about 3 seconds at 16kHz 16-bit)
+      const MAX_CHUNK_BYTES = 100000
+      const sentCount = Math.ceil(pcm.byteLength / MAX_CHUNK_BYTES)
+      for (let i = 0; i < sentCount; i++) {
+        if (ws.readyState !== 1) return
+        const offset = i * MAX_CHUNK_BYTES
+        const end = Math.min(offset + MAX_CHUNK_BYTES, pcm.byteLength)
+        const chunkPcm = pcm.slice(offset, end)
+        const wav = pcm16ToWav(chunkPcm, sampleRate)
+        const b64 = arrayBufferToBase64(wav)
+        ws.send(JSON.stringify({
+          audio: {
+            data: b64,
+            sample_rate: sampleRate,
+            encoding: 'audio/wav',
+          },
+        }))
+      }
+      this.ctx?.logger?.info('sarvam-stt', `Sent audio in ${sentCount} chunks + flush`)
 
       // Send flush signal to finalize transcription
       if (ws.readyState === 1) {

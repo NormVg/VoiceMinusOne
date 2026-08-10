@@ -228,14 +228,17 @@ export class SessionManager {
     this.logger.debug('session', 'User stopped speaking')
 
     if (this.liveSttStream) {
+      this.logger.info('session', 'Flushing live STT stream...')
       await this.liveSttStream.flush()
       await this.waitForLiveSttResult()
       const finalTranscript = this.liveSttResults.find((result) => result.isFinal)
       await this.closeLiveStt()
       if (finalTranscript?.text.trim()) {
+        this.logger.info('session', `Live STT got transcript: "${finalTranscript.text.substring(0, 60)}"`)
         await this.runTurn([], finalTranscript)
         return
       }
+      this.logger.warn('session', 'Live STT produced no transcript, falling back to batch')
     }
 
     // Fallback for batch-only STT providers.
@@ -316,7 +319,10 @@ export class SessionManager {
       let sentenceCount = 0
       const sentenceChunker = new SentenceChunker()
       const ttsStream = this.tts.openStream
-        ? await this.tts.openStream({}, signal)
+        ? await this.tts.openStream({}, signal).catch((err: Error) => {
+            this.logger.warn('session', `TTS openStream failed, using batch: ${err.message}`)
+            return null
+          })
         : null
       const streamAudioTask = ttsStream
         ? this.forwardTtsStream(ttsStream, signal, () => {
@@ -489,11 +495,15 @@ export class SessionManager {
   }
 
   private async openLiveStt(): Promise<void> {
-    if (!this.stt.openStream) return
+    if (!this.stt.openStream) {
+      this.logger.debug('session', 'STT provider has no openStream, using batch fallback')
+      return
+    }
     await this.closeLiveStt()
     const controller = new AbortController()
     this.liveSttAbort = controller
     try {
+      this.logger.info('session', 'Opening live STT stream...')
       const stream = await this.stt.openStream({}, controller.signal)
       this.liveSttStream = stream
       this.liveSttResults = []
@@ -504,6 +514,7 @@ export class SessionManager {
           if (result.isFinal) return
         }
       })()
+      this.logger.info('session', 'Live STT stream opened successfully')
     } catch (error) {
       this.logger.warn('session', `Live STT unavailable, using batch fallback: ${(error as Error).message}`)
       this.liveSttAbort = null

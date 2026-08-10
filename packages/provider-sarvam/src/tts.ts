@@ -407,11 +407,9 @@ export class SarvamTTS implements TTSProvider {
     void configSent
   }
 
-  /** REST synthesis — uses the streaming HTTP endpoint for lower latency.
+  /** REST synthesis — uses the standard /text-to-speech endpoint.
    *
-   *  The /text-to-speech/stream endpoint returns raw binary audio as a
-   *  stream (no base64, no JSON parsing). Audio starts arriving as soon
-   *  as the first chunk is synthesized.
+   *  Returns base64-encoded WAV audio in a JSON response.
    */
   private async *synthesizeRest(
     text: string,
@@ -435,7 +433,7 @@ export class SarvamTTS implements TTSProvider {
       output_audio_codec: 'wav',
     }
 
-    const res = await fetch(`${this.baseUrl}/text-to-speech/stream`, {
+    const res = await fetch(`${this.baseUrl}/text-to-speech`, {
       method: 'POST',
       headers: {
         ...authHeaders(this.apiKey),
@@ -450,49 +448,16 @@ export class SarvamTTS implements TTSProvider {
       throw new PluginError('TTS_FAILED', `Sarvam TTS ${res.status}: ${errBody}`)
     }
 
-    // Stream the binary audio response
-    if (!res.body) {
-      // Fallback: read full response as arraybuffer
-      const buf = await res.arrayBuffer()
-      const pcm = stripWavHeader(buf)
+    // The REST API returns JSON with base64-encoded audio
+    const json = (await res.json()) as { audios?: string[] }
+    if (!json.audios || json.audios.length === 0) return
+
+    for (const b64 of json.audios) {
+      const wav = base64ToArrayBuffer(b64)
+      const pcm = stripWavHeader(wav)
       if (pcm.byteLength > 0) {
         yield { data: pcm, sampleRate: opts.sampleRate, numChannels: opts.numChannels }
       }
-      return
-    }
-
-    // Read the stream in chunks
-    const reader = res.body.getReader()
-    const chunks: ArrayBuffer[] = []
-    let totalBytes = 0
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        if (opts.signal.aborted) break
-
-        chunks.push(value.buffer)
-        totalBytes += value.byteLength
-      }
-    } finally {
-      reader.releaseLock()
-    }
-
-    if (totalBytes === 0) return
-
-    // Concatenate all chunks
-    const combined = new Uint8Array(totalBytes)
-    let offset = 0
-    for (const chunk of chunks) {
-      combined.set(new Uint8Array(chunk), offset)
-      offset += chunk.byteLength
-    }
-
-    // Strip WAV header if present
-    const pcm = stripWavHeader(combined.buffer)
-    if (pcm.byteLength > 0) {
-      yield { data: pcm, sampleRate: opts.sampleRate, numChannels: opts.numChannels }
     }
   }
 
